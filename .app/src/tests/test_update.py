@@ -41,6 +41,7 @@ def _write_project(base: Path, version: str, min_launcher: int | None = None,
         ".app/src/deck_inventory/modulo.py": f"# codice {version}\n",
         ".app/src/CHANGELOG.txt": changelog,
         ".app/src/pyproject.toml": f'[project]\nname = "x"\n# {version}\n',
+        ".app/src/uv.lock": f"# lock {version}\n",
         "README.txt": f"README {version}\n" if readme is None else readme,
         **USER_FILES,
     }
@@ -274,6 +275,7 @@ def _good_entries(version="1.1.0"):
     return {
         "Deck Inventory/README.txt": "nuovo",
         "Deck Inventory/.app/src/pyproject.toml": "x",
+        "Deck Inventory/.app/src/uv.lock": "x",
         "Deck Inventory/.app/src/CHANGELOG.txt": CHANGELOG,
         "Deck Inventory/.app/src/deck_inventory/__init__.py": f'VERSION = "{version}"\n',
     }
@@ -287,7 +289,9 @@ def _good_entries(version="1.1.0"):
     lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("__init__.py")}),
     lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("README.txt")}),
     lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("pyproject.toml")}),
-], ids=["troncato", "dotdot", "dotdot-annidato", "assoluto", "senza-init", "senza-readme", "senza-pyproject"])
+    lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("uv.lock")}),
+], ids=["troncato", "dotdot", "dotdot-annidato", "assoluto", "senza-init", "senza-readme", "senza-pyproject",
+        "senza-uvlock"])
 def test_bad_zip_keeps_old(proj, tmp_path, make):
     data = make(_release_zip(tmp_path, "1.1.0"))
     before = _snapshot(proj)
@@ -511,7 +515,7 @@ def _interrupted(proj, *, src_state: str):
     (upd / "swap-in-progress").touch()
     (proj / ".app/src").rename(upd / "previous")
     if src_state == "half-new":
-        (upd / "previous/README.txt.bak").write_bytes((proj / "README.txt").read_bytes())
+        (upd / "README.txt.bak").write_bytes((proj / "README.txt").read_bytes())
         (proj / ".app/src/deck_inventory").mkdir(parents=True)
         (proj / ".app/src/deck_inventory/__init__.py").write_text('VERSION = "1.1.0"\n')
         (proj / "README.txt").write_text("README NUOVO 1.1.0\n")
@@ -556,7 +560,7 @@ def test_failed_restore_keeps_previous_for_next_run(proj, tmp_path, monkeypatch)
     data = _release_zip(tmp_path, "1.1.0")
     before = _snapshot(proj)
 
-    def broken_restore(src, previous, readme):
+    def broken_restore(src, previous, readme, bak):
         raise OSError("ripristino impossibile")
 
     monkeypatch.setattr(update, "_restore", broken_restore)
@@ -696,3 +700,275 @@ def test_main_run_sync_command(main_env, monkeypatch, proj):
     assert calls[0]["run_sync"](src) is True
     assert calls[0]["run_sync"](src) is False
     assert runs[0] == [str(uv), "sync", "--project", str(src), "--frozen", "--no-dev"]
+
+
+# --- un solo aggiornamento alla volta (blocco) --------------------------------
+
+def _hold_lock(proj):
+    """Tiene il blocco come farebbe un altro avvio (altro descrittore di file)."""
+    fd = update._acquire(proj / ".app/runtime/update" / update.LOCK_NAME)
+    assert fd is not None
+    return fd
+
+
+def test_lock_held_skips_and_touches_nothing(proj, tmp_path):
+    _interrupted(proj, src_state="half-new")  # ci sarebbe anche un ripristino da fare
+    before = _snapshot(proj)
+    upd = proj / ".app/runtime/update"
+    fd = _hold_lock(proj)
+    runtime_before = sorted(p.relative_to(upd).as_posix() for p in upd.rglob("*"))
+    try:
+        def no_api(url):
+            raise AssertionError("nessun controllo mentre un altro avvio aggiorna")
+        sync = Sync()
+        out = update.check_and_update(proj, 1, no_api, None, sync, _now)
+    finally:
+        update._release(fd)
+    assert out.status == "skipped"
+    assert _snapshot(proj) == before
+    assert sorted(p.relative_to(upd).as_posix() for p in upd.rglob("*")) == runtime_before
+    assert sync.calls == []
+    assert _error_log(proj) == ""
+
+
+@pytest.mark.skipif(update.os.name == "nt", reason="processo di prova con fcntl")
+def test_lock_held_by_other_process_skips(proj):
+    import subprocess
+    import sys
+    lock = proj / ".app/runtime/update" / update.LOCK_NAME
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c",
+         "import fcntl, os, sys; fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT); "
+         "fcntl.flock(fd, fcntl.LOCK_EX); print('ok', flush=True); sys.stdin.read()", str(lock)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "ok"
+        before = _snapshot(proj)
+        assert _run(proj, b"non scaricare").status == "skipped"
+        assert _snapshot(proj) == before
+    finally:
+        holder.stdin.close()
+        holder.wait(timeout=10)
+    # Processo finito: il blocco è libero di nuovo.
+    assert _run(proj, fetch_json=_api("v1.0.0")).status == "current"
+
+
+def test_concurrent_run_during_swap_is_skipped(proj, tmp_path):
+    """Il secondo avvio parte mentre il primo è a metà scambio: prima perdeva .app/src."""
+    data = _release_zip(tmp_path, "1.1.0")
+    second = []
+
+    def sync_a(src):
+        # A ha appena messo la versione nuova; B (secondo doppio clic) prova a partire.
+        second.append(update.check_and_update(proj, 1, _api("v1.1.0"), None, Sync(), _now))
+        return True
+
+    out = _run(proj, data, sync=sync_a)
+    assert [o.status for o in second] == ["skipped"]
+    assert out.status == "updated", _error_log(proj)
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+    upd = proj / ".app/runtime/update"
+    assert not (upd / "previous").exists() and not (upd / "swap-in-progress").exists()
+    # Blocco rilasciato: l'avvio successivo lavora normalmente.
+    assert _run(proj, fetch_json=_api("v1.1.0")).status == "current"
+
+
+def test_marker_already_gone_does_not_roll_back(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0")
+
+    def sync(src):
+        (proj / ".app/runtime/update/swap-in-progress").unlink()
+        return True
+
+    out = _run(proj, data, sync=sync)
+    assert out.status == "updated", _error_log(proj)
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+
+
+def test_lock_released_after_exception(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    monkeypatch.setattr(update, "_notes", lambda *a: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        _run(proj, data)
+    monkeypatch.undo()
+    fd = update._acquire(proj / ".app/runtime/update" / update.LOCK_NAME)
+    assert fd is not None
+    update._release(fd)
+
+
+def test_lock_unavailable_logs_and_fails(proj, monkeypatch):
+    def unsupported(fd):
+        raise OSError(45, "blocchi non supportati")
+    monkeypatch.setattr(update, "_lock_fd", unsupported)
+    before = _snapshot(proj)
+    out = _run(proj)
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert "blocco" in _error_log(proj)
+
+
+def test_lock_contention_seam_skips(proj, monkeypatch):
+    """Simula il blocco occupato come lo segnala Windows (EACCES)."""
+    def busy(fd):
+        raise PermissionError(13, "occupato")
+    monkeypatch.setattr(update, "_lock_fd", busy)
+    before = _snapshot(proj)
+    assert _run(proj).status == "skipped"
+    assert _snapshot(proj) == before
+
+
+def test_windows_lock_uses_msvcrt_on_first_byte(tmp_path, monkeypatch):
+    import os
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_NBLCK, LK_UNLCK = 2, 0
+        busy = False
+
+        @classmethod
+        def locking(cls, fd, mode, nbytes):
+            calls.append((os.lseek(fd, 0, os.SEEK_CUR), mode, nbytes))
+            if mode == cls.LK_NBLCK and cls.busy:
+                raise PermissionError(13, "occupato")
+
+    monkeypatch.setattr(update, "msvcrt", FakeMsvcrt, raising=False)
+    monkeypatch.setattr(update, "_lock_fd", update._lock_windows)
+    monkeypatch.setattr(update, "_unlock_fd", update._unlock_windows)
+    path = tmp_path / "lock"
+    path.write_bytes(b"xyz")  # posizione iniziale diversa da 0 dopo la scrittura
+    fd = update._acquire(path)
+    assert fd is not None
+    os.lseek(fd, 2, os.SEEK_SET)
+    update._release(fd)
+    assert calls == [(0, FakeMsvcrt.LK_NBLCK, 1), (0, FakeMsvcrt.LK_UNLCK, 1)]
+    FakeMsvcrt.busy = True
+    assert update._acquire(path) is None
+
+
+# --- finestra pericolosa minima e ultima risorsa ------------------------------
+
+def test_readme_backed_up_before_src_moves(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    events = []
+    real_move, real_copy2 = update._move, update.shutil.copy2
+    bak = proj / ".app/runtime/update/README.txt.bak"
+
+    def move(src, dst):
+        events.append(("move", Path(src).name, Path(dst).name))
+        real_move(src, dst)
+
+    def copy2(a, b):
+        events.append(("copy2", Path(a).name, Path(b).name))
+        return real_copy2(a, b)
+
+    monkeypatch.setattr(update, "_move", move)
+    monkeypatch.setattr(update.shutil, "copy2", copy2)
+    out = _run(proj, data)
+    assert out.status == "updated", _error_log(proj)
+    # Prima il README, poi le due rinomine una dopo l'altra.
+    assert events == [("copy2", "README.txt", "README.txt.bak"),
+                      ("move", "src", "previous"), ("move", "src", "src")]
+    assert not bak.exists()
+
+
+def _restore_that_loses_src(src, previous, readme, bak):
+    """Ripristino che cancella `.app/src` e poi fallisce (es. disco pieno a metà)."""
+    import shutil
+    shutil.rmtree(src)
+    raise OSError("ripristino interrotto")
+
+
+def test_failed_restore_overlays_previous_so_src_stays_runnable(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+    monkeypatch.setattr(update, "_restore", _restore_that_loses_src)
+    out = _run(proj, data, sync=Sync([False]))
+    monkeypatch.undo()
+    assert out.status == "failed"
+    src = proj / ".app/src"
+    assert update._complete(src)
+    assert update.read_meta(src)[0] == "1.0.0"
+    assert (src / "deck_inventory/modulo.py").read_text(encoding="utf-8") == "# codice 1.0.0\n"
+    upd = proj / ".app/runtime/update"
+    assert (upd / "previous").exists() and (upd / "swap-in-progress").exists()
+    assert "ultima risorsa" in _error_log(proj)
+    # Il programma riparte: il prossimo avvio completa il ripristino pulito.
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now)
+    assert out.status == "current"
+    assert _snapshot(proj) == before
+    assert not (upd / "previous").exists() and not (upd / "swap-in-progress").exists()
+
+
+def test_failed_overlay_logs_manual_instructions(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    real_copytree = update.shutil.copytree
+
+    def copytree(a, b, **kw):
+        if Path(a).name == "previous":
+            raise OSError("disco pieno")
+        return real_copytree(a, b, **kw)
+
+    monkeypatch.setattr(update, "_restore", _restore_that_loses_src)
+    monkeypatch.setattr(update.shutil, "copytree", copytree)
+    out = _run(proj, data, sync=Sync([False]))
+    assert out.status == "failed"
+    log = _error_log(proj)
+    assert "disco pieno" in log and "riscaricalo" in log
+    assert f"github.com/{update.UPDATE_REPO}/releases/latest" in log
+    assert (proj / ".app/runtime/update/previous/deck_inventory/__init__.py").exists()
+
+
+def test_failed_recovery_also_overlays_previous(proj, monkeypatch):
+    before = _snapshot(proj)
+    _interrupted(proj, src_state="half-new")
+    monkeypatch.setattr(update, "_restore", _restore_that_loses_src)
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now)
+    monkeypatch.undo()
+    assert out.status == "failed"
+    assert update._complete(proj / ".app/src")
+    assert "ultima risorsa" in _error_log(proj)
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now)
+    assert out.status == "current"
+    assert _snapshot(proj) == before
+
+
+# --- rete --------------------------------------------------------------------
+
+class _Resp(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+def test_http_headers(monkeypatch):
+    seen = []
+
+    def urlopen(req, timeout):
+        seen.append((req.full_url, dict(req.header_items()), timeout))
+        return _Resp(b'{"a": 1}')
+
+    monkeypatch.setattr(update.urllib.request, "urlopen", urlopen)
+    assert update.http_json("https://api.example/latest") == {"a": 1}
+    assert update.http_bytes("https://example/deck-inventory.zip") == b'{"a": 1}'
+    (_, h_json, t_json), (_, h_bytes, t_bytes) = seen
+    assert h_json["Accept"] == "application/vnd.github+json" and t_json == 3
+    assert h_bytes["Accept"] == "application/octet-stream" and t_bytes == 30
+    assert h_json["User-agent"].startswith("deck-inventory/")
+    assert h_bytes["User-agent"].startswith("deck-inventory/")
+
+
+def test_latest_release_on_real_github_shape():
+    """JSON vero di api.github.com (release di astral-sh/uv, accorciato): stessa forma."""
+    import json
+    data = json.loads((Path(__file__).parent / "fixtures/github_release_latest.json").read_text(encoding="utf-8"))
+    assert update.latest_release(lambda u: data) is None  # nessun asset deck-inventory.zip
+    asset = dict(data["assets"][0])
+    asset["name"] = "deck-inventory.zip"
+    data["assets"].append(asset)
+    rel = update.latest_release(lambda u: data)
+    assert rel == update.Release(data["tag_name"].lstrip("v"), asset["browser_download_url"])
+    assert rel.zip_url.startswith("https://github.com/")

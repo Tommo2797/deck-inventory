@@ -7,6 +7,18 @@ Contratto fisso con i launcher (che non si aggiornano mai): chiamano
 DECK_INVENTORY_LAUNCHER (numero di versione del launcher) e DECK_INVENTORY_UV
 (percorso di uv). Le versioni future devono mantenere questo percorso di modulo
 e questi nomi; se i launcher devono cambiare, alzare MIN_LAUNCHER.
+Altri vincoli che valgono per OGNI versione futura:
+- Dopo lo scambio, il messaggio "aggiornato" lo mostra `deck_inventory.dialogs`
+  della versione NUOVA (importato dentro `main`): `dialogs.info(str)` deve
+  continuare a esistere e quel modulo deve importare solo standard library o
+  moduli stabili del pacchetto.
+- I launcher usano sempre uv 0.13.1 (UV_VERSION, fisso): ogni pyproject.toml e
+  uv.lock futuri devono funzionare con `uv sync --frozen` di quella versione,
+  altrimenti ogni aggiornamento fallisce il sync e torna indietro.
+- I launcher, prima di questo passo, fanno `uv sync` e importano da `.app/src`:
+  se `.app/src` è incompleta il programma non arriva qui e nessun ripristino
+  automatico è possibile. Per questo lo scambio lascia `.app/src` mancante solo
+  per l'istante fra due rinomine consecutive.
 
 Tocca solo `.app/src/` e `README.txt`. Scambio delle cartelle con rollback:
 o si installa tutta la versione nuova o resta quella di prima. Non solleva mai.
@@ -31,10 +43,16 @@ from typing import Callable, Literal
 from deck_inventory import UPDATE_REPO, VERSION
 from deck_inventory.changelog import between, format_entries, parse, parse_version
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 API_URL = "https://api.github.com/repos/{repo}/releases/latest"
 API_ENV = "DECK_INVENTORY_UPDATE_API"  # solo per i test manuali: sostituisce l'URL completo
 ASSET_NAME = "deck-inventory.zip"
-REQUIRED = (".app/src/deck_inventory/__init__.py", ".app/src/pyproject.toml", "README.txt")
+REQUIRED = (".app/src/deck_inventory/__init__.py", ".app/src/pyproject.toml", ".app/src/uv.lock",
+            "README.txt")
 MOVE_ATTEMPTS = 5
 MOVE_DELAY = 0.5
 README_BAK = "README.txt.bak"
@@ -74,21 +92,22 @@ class Outcome:
 
 # --- rete ---------------------------------------------------------------------
 
-def _request(url: str, timeout: float) -> bytes:
+def _request(url: str, timeout: float, accept: str) -> bytes:
     req = urllib.request.Request(url, headers={
         "User-Agent": f"deck-inventory/{VERSION}",
-        "Accept": "application/vnd.github+json",
+        "Accept": accept,
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
 def http_json(url: str) -> dict:
-    return json.loads(_request(url, 3))
+    return json.loads(_request(url, 3, "application/vnd.github+json"))
 
 
 def http_bytes(url: str) -> bytes:
-    return _request(url, 30)
+    # browser_download_url rimanda (redirect) al file vero: si chiede il file, non JSON.
+    return _request(url, 30, "application/octet-stream")
 
 
 def latest_release(fetch_json: Callable[[str], dict]) -> Release | None:
@@ -217,9 +236,8 @@ def _complete(src: Path) -> bool:
     return (src / "deck_inventory" / "__init__.py").is_file() and (src / "pyproject.toml").is_file()
 
 
-def _restore(src: Path, previous: Path, readme: Path) -> None:
-    """Rimette la vecchia `.app/src` (da `previous`) e il README salvato."""
-    bak = previous / README_BAK
+def _restore(src: Path, previous: Path, readme: Path, bak: Path) -> None:
+    """Rimette la vecchia `.app/src` (da `previous`) e il README salvato in `bak`."""
     if bak.exists():
         os.replace(bak, readme)
     if src.exists():
@@ -233,9 +251,90 @@ def _restore(src: Path, previous: Path, readme: Path) -> None:
     _move(previous, src)
 
 
+def _overlay_previous(src: Path, previous: Path, log: Callable[[str], None]) -> None:
+    """Ultima risorsa dopo un ripristino fallito: copia la versione vecchia sopra `.app/src`.
+
+    I launcher fanno `uv sync` e importano da `.app/src` prima di arrivare qui: se
+    `.app/src` resta incompleta, nessun ripristino automatico può più partire.
+    `previous` e il segnale restano: se il programma riparte, il prossimo avvio
+    rifà il ripristino pulito.
+    """
+    try:
+        if _complete(previous):
+            shutil.copytree(previous, src, dirs_exist_ok=True)
+            log("copiata la versione precedente sopra .app/src (ultima risorsa); "
+                "al prossimo avvio si completa il ripristino")
+            return
+        log("la copia della versione precedente in .app/runtime/update/previous è incompleta")
+    except Exception as e:
+        log(f"anche la copia della versione precedente sopra .app/src non è riuscita: {e!r}")
+    log("ATTENZIONE: .app/src potrebbe essere incompleta. Se Deck Inventory non parte, "
+        f"riscaricalo da https://github.com/{UPDATE_REPO}/releases/latest "
+        "(settings.txt e la cartella decks si possono copiare nella nuova cartella)")
+
+
 def _notes(src: Path, old: str, new: str) -> str:
     text = (src / "CHANGELOG.txt").read_text(encoding="utf-8")
     return format_entries(between(parse(text), old, new))
+
+
+# --- blocco: un solo aggiornamento alla volta ---------------------------------
+
+LOCK_NAME = "lock"
+
+
+def _lock_posix(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_posix(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _lock_windows(fd: int) -> None:
+    # Si blocca sempre il primo byte (anche oltre la fine del file vuoto: è ammesso).
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+
+
+def _unlock_windows(fd: int) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+if os.name == "nt":
+    _lock_fd, _unlock_fd = _lock_windows, _unlock_windows
+else:
+    _lock_fd, _unlock_fd = _lock_posix, _unlock_posix
+
+
+def _acquire(path: Path) -> int | None:
+    """Apre e blocca `path` senza aspettare. None se lo tiene già un altro avvio.
+
+    Il blocco del sistema operativo sparisce da solo se il processo muore.
+    Solleva OSError per gli altri errori (cartella non scrivibile, blocchi non supportati).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        _lock_fd(fd)
+    except (BlockingIOError, PermissionError):
+        # Occupato: POSIX → EWOULDBLOCK, Windows (LK_NBLCK) → EACCES.
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release(fd: int) -> None:
+    try:
+        _unlock_fd(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def check_and_update(root: Path, launcher: int,
@@ -244,18 +343,45 @@ def check_and_update(root: Path, launcher: int,
                      run_sync: Callable[[Path], bool],
                      now: Callable[[], str]) -> Outcome:
     root = Path(root)
-    src = root / ".app" / "src"
-    work = root / ".app" / "runtime" / "update"
-    staging, previous = work / "staging", work / "previous"
-    marker = work / "swap-in-progress"
-    readme = root / "README.txt"
+    if (root / ".git").exists() or launcher < 1:
+        return Outcome("skipped", VERSION)
+    log = _logger(root, now)
+    # Due avvii quasi insieme (doppio doppio clic): il secondo non tocca niente,
+    # neanche il ripristino, finché il primo non ha finito.
+    try:
+        fd = _acquire(root / ".app" / "runtime" / "update" / LOCK_NAME)
+    except OSError as e:
+        log(f"blocco non disponibile, aggiornamento saltato: {e!r}")
+        return Outcome("failed", VERSION)
+    if fd is None:
+        return Outcome("skipped", VERSION)
+    try:
+        return _check_and_update_locked(root, launcher, fetch_json, fetch_bytes, run_sync, log)
+    finally:
+        _release(fd)
 
+
+def _logger(root: Path, now: Callable[[], str]) -> Callable[[str], None]:
     def log(msg: str) -> None:
         try:
             stamp = now()
         except Exception:
             stamp = "?"
         log_error(root, f"{stamp} aggiornamento: {msg}")
+    return log
+
+
+def _check_and_update_locked(root: Path, launcher: int,
+                             fetch_json: Callable[[str], dict],
+                             fetch_bytes: Callable[[str], bytes],
+                             run_sync: Callable[[Path], bool],
+                             log: Callable[[str], None]) -> Outcome:
+    src = root / ".app" / "src"
+    work = root / ".app" / "runtime" / "update"
+    staging, previous = work / "staging", work / "previous"
+    marker = work / "swap-in-progress"
+    bak = work / README_BAK
+    readme = root / "README.txt"
 
     def sync(label: str) -> None:
         try:
@@ -268,9 +394,7 @@ def check_and_update(root: Path, launcher: int,
 
     old = VERSION
     try:
-        if (root / ".git").exists() or launcher < 1:
-            return Outcome("skipped", old)
-        _recover(src, previous, marker, readme, log, sync)
+        _recover(src, previous, marker, readme, bak, log, sync)
         old = read_meta(src)[0]
         release = latest_release(fetch_json)
         if release is None:
@@ -308,31 +432,35 @@ def check_and_update(root: Path, launcher: int,
 
         if previous.exists():
             _remove(previous)  # _recover ha già stabilito che non serve
+        # Tutto il preparabile si fa prima: fra le due rinomine di `.app/src`
+        # (vecchia → previous, nuova → src) non c'è nient'altro.
+        bak.unlink(missing_ok=True)
+        if had_readme:
+            shutil.copy2(readme, bak)
         marker.touch()
         _move(src, previous)
         old_moved = True
-        if had_readme:
-            shutil.copy2(readme, previous / README_BAK)
         _move(rel_root / ".app" / "src", src)
         os.replace(rel_root / "README.txt", readme)
         readme_replaced = True
         if not run_sync(src):
             raise UpdateError("uv sync non riuscito con la nuova versione")
-        marker.unlink()  # scambio concluso: da qui in poi niente ripristino
+        marker.unlink(missing_ok=True)  # scambio concluso: da qui in poi niente ripristino
     except Exception as e:
         log(f"installazione della {new} non riuscita, resta la {old}: {e!r}")
         restored = True
         if old_moved:
             try:
-                _restore(src, previous, readme)
+                _restore(src, previous, readme, bak)
                 if readme_replaced and not had_readme and readme.exists():
                     readme.unlink()
                 sync("anche sulla versione ripristinata")
             except Exception as e2:
                 restored = False
-                log(f"ripristino non riuscito, si riprova al prossimo avvio: {e2!r}")
+                log(f"ripristino della versione precedente non riuscito: {e2!r}")
+                _overlay_previous(src, previous, log)
         if restored:
-            _settle(src, previous, marker, staging)
+            _settle(src, previous, marker, bak, staging)
         else:
             _cleanup(staging)  # `previous` e il segnale restano per _recover
         return Outcome("failed", old, new)
@@ -342,20 +470,29 @@ def check_and_update(root: Path, launcher: int,
     except Exception as e:
         log(f"CHANGELOG della {new} illeggibile, note omesse: {e!r}")
         notes = ""
-    _cleanup(staging, previous)
+    _settle(src, previous, marker, bak, staging)
     return Outcome("updated", old, new, notes)
 
 
-def _recover(src, previous, marker, readme, log, sync) -> None:
-    """Sistema i resti di uno scambio interrotto (programma chiuso a metà, ripristino fallito)."""
+def _recover(src, previous, marker, readme, bak, log, sync) -> None:
+    """Sistema i resti di uno scambio interrotto (programma chiuso a metà, ripristino fallito).
+
+    Funziona solo se `.app/src` è abbastanza completa da far arrivare i launcher
+    fin qui (vedi il contratto in cima al modulo).
+    """
     if _complete(previous) and (marker.exists() or not _complete(src)):
         log("scambio interrotto trovato: ripristino la versione precedente")
-        _restore(src, previous, readme)
+        try:
+            _restore(src, previous, readme, bak)
+        except Exception as e:
+            log(f"ripristino della versione precedente non riuscito: {e!r}")
+            _overlay_previous(src, previous, log)
+            raise
         sync("dopo il ripristino della versione precedente")
-    _settle(src, previous, marker)
+    _settle(src, previous, marker, bak)
 
 
-def _settle(src: Path, previous: Path, marker: Path, *extra: Path) -> None:
+def _settle(src: Path, previous: Path, marker: Path, bak: Path, *extra: Path) -> None:
     """Pulisce solo se `.app/src` è completa; altrimenti lascia tutto per il prossimo avvio.
 
     Le copie `.partial` non sono mai affidabili e si eliminano sempre.
@@ -363,6 +500,7 @@ def _settle(src: Path, previous: Path, marker: Path, *extra: Path) -> None:
     _cleanup(_partial(src), _partial(previous), *extra)
     if _complete(src):
         marker.unlink(missing_ok=True)
+        bak.unlink(missing_ok=True)
         _cleanup(previous)
 
 
