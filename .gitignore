@@ -1,0 +1,9 @@
+/.app/runtime/
+/settings.txt
+/decks/
+/Inventory *.html
+__pycache__/
+.pytest_cache/
+/.superpowers/
+.DS_Store
+/.app/src/tests/private/

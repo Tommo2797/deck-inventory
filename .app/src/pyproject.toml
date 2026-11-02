@@ -1,0 +1,17 @@
+[project]
+name = "deck-inventory"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["playwright"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-m 'not online'"
+markers = ["online: test che usano il sito reale (esclusi di default)"]
+
+[tool.uv]
+package = false

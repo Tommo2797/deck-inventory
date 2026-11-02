@@ -1,0 +1,20 @@
+Legend:
+1 Blaze Captain
+
+Champion:
+1 Ember Fox
+
+MainDeck:
+3 Arc Bolt
+3 Ember Fox
+3 Iron Ballista
+
+Battlefields:
+1 Silent Harbor
+
+Runes:
+12 Fury Rune
+
+Sideboard:
+1 Stone Sentry
+1 Arc Bolt
