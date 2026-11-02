@@ -23,7 +23,8 @@ PRIMO AVVIO
    anche un browser di alcune centinaia di MB (solo la prima volta).
 6. Al termine si apre la pagina con i risultati.
 
-Dai avvii successivi bastano pochi secondi.
+Dai avvii successivi bastano pochi secondi (qualcosa in più quando
+Deck Inventory installa una versione nuova).
 Nota: il file per Windows non è ancora stato provato. Il percorso della
 cartella non deve contenere i caratteri & o %.
 
@@ -53,7 +54,8 @@ doppio clic su Start per aggiornarlo.
 SE QUALCOSA NON VA
 ------------------
 Se compare "Piltover Archive è cambiato", il sito è stato modificato:
-chiedi una versione aggiornata di Deck Inventory. Nel messaggio e in fondo
+quando esce una versione corretta, Deck Inventory la installa da solo a un
+avvio successivo. Se tarda, chiedila all'autore. Nel messaggio e in fondo
 alla pagina trovi il numero di versione.
 
 CONDIVIDERE

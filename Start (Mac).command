@@ -124,6 +124,12 @@ if ! "$UV" sync --project "$SRC" --frozen --no-dev; then
 fi
 printf '%s\n' "$STATE" > "$STATE_FILE"
 
+# Aggiornamento automatico (logica tutta in Python, che si aggiorna da sé).
+# Non blocca mai l'avvio: il codice d'uscita si ignora.
+export DECK_INVENTORY_LAUNCHER=1
+export DECK_INVENTORY_UV="$UV"
+"$UV" run --project "$SRC" --frozen --no-dev python -m deck_inventory.update "$ROOT"
+
 # In caso di errore Deck Inventory ha già mostrato il suo messaggio.
 "$UV" run --project "$SRC" --frozen --no-dev python -m deck_inventory "$ROOT"
 finish $?

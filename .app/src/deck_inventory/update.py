@@ -1,5 +1,7 @@
 """Aggiornamento automatico dall'ultima release pubblicata su GitHub.
 
+Avvio (dai launcher, prima del programma): python -m deck_inventory.update <cartella del progetto>
+
 Tocca solo `.app/src/` e `README.txt`. Scambio delle cartelle con rollback:
 o si installa tutta la versione nuova o resta quella di prima. Non solleva mai.
 Solo standard library: deve funzionare anche se il resto del programma è rotto.
@@ -10,10 +12,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Callable, Literal
 
@@ -27,6 +32,17 @@ REQUIRED = (".app/src/deck_inventory/__init__.py", ".app/src/pyproject.toml", "R
 MOVE_ATTEMPTS = 5
 MOVE_DELAY = 0.5
 README_BAK = "README.txt.bak"
+
+UPDATED_MESSAGE = (
+    "Deck Inventory è stato aggiornato dalla versione {old} alla versione {new}.\n\n"
+    "Novità:\n{notes}"
+)
+NEEDS_LAUNCHER_MESSAGE = (
+    "È disponibile la versione {new} di Deck Inventory, ma per installarla serve "
+    "scaricarla di nuovo a mano da:\n"
+    "https://github.com/{repo}/releases/latest\n\n"
+    "Per ora continui a usare la versione {old}."
+)
 
 _rename = os.rename
 _sleep = time.sleep
@@ -347,3 +363,52 @@ def _settle(src: Path, previous: Path, marker: Path, *extra: Path) -> None:
 def _cleanup(*paths: Path) -> None:
     for p in paths:
         shutil.rmtree(p, ignore_errors=True)
+
+
+# --- punto di ingresso --------------------------------------------------------
+
+def _launcher_version() -> int:
+    try:
+        return int(os.environ.get("DECK_INVENTORY_LAUNCHER", "0"))
+    except ValueError:
+        return 0
+
+
+def _uv_sync(src: Path) -> bool:
+    uv = os.environ.get("DECK_INVENTORY_UV", "").strip()
+    if not uv or not Path(uv).is_file():
+        return False
+    try:
+        return subprocess.run([uv, "sync", "--project", str(src), "--frozen", "--no-dev"]).returncode == 0
+    except OSError:
+        return False
+
+
+def _message(outcome: Outcome) -> str | None:
+    if outcome.status == "updated":
+        return UPDATED_MESSAGE.format(old=outcome.old, new=outcome.new, notes=outcome.notes)
+    if outcome.status == "needs_launcher":
+        return NEEDS_LAUNCHER_MESSAGE.format(old=outcome.old, new=outcome.new, repo=UPDATE_REPO)
+    return None
+
+
+def main(argv: list[str], ui=None) -> int:
+    """Passo di aggiornamento dei launcher. Restituisce sempre 0: non blocca mai l'avvio."""
+    root = Path(argv[1]) if len(argv) > 1 else None
+    if root is None:
+        return 0
+    try:
+        outcome = check_and_update(root, _launcher_version(), http_json, http_bytes, _uv_sync,
+                                   lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        message = _message(outcome)
+        if message and os.environ.get("DECK_INVENTORY_NO_DIALOG") != "1":
+            if ui is None:
+                from deck_inventory import dialogs as ui
+            ui.info(message)
+    except Exception as e:
+        log_error(root, f"aggiornamento: errore imprevisto: {e!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

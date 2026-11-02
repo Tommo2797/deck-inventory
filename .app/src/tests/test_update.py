@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import io
 import zipfile
@@ -369,9 +370,17 @@ def test_log_error_appends(tmp_path):
 
 
 def test_module_has_no_ui_imports():
-    text = Path(update.__file__).read_text(encoding="utf-8")
-    for name in ("tkinter", "playwright", "dialogs", "deck_inventory.main"):
-        assert f"import {name}" not in text and f"from {name}" not in text
+    """A livello di modulo solo standard library e changelog: i dialoghi si importano
+    solo dentro main, quando c'è un messaggio da mostrare."""
+    tree = ast.parse(Path(update.__file__).read_text(encoding="utf-8"))
+    imported = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported |= {f"{node.module}.{a.name}" for a in node.names} | {node.module}
+    for name in imported:
+        assert not any(bad in name for bad in ("tkinter", "playwright", "dialogs", "deck_inventory.main"))
 
 
 # --- file bloccati e scambi interrotti -------------------------------------
@@ -560,3 +569,130 @@ def test_failed_restore_keeps_previous_for_next_run(proj, tmp_path, monkeypatch)
     out = update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now)
     assert out.status == "current"
     assert _snapshot(proj) == before
+
+
+# --- punto di ingresso (main) ------------------------------------------------
+
+class FakeUI:
+    def __init__(self):
+        self.infos: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.infos.append(message)
+
+
+@pytest.fixture
+def main_env(monkeypatch):
+    monkeypatch.delenv("DECK_INVENTORY_NO_DIALOG", raising=False)
+    monkeypatch.setenv("DECK_INVENTORY_LAUNCHER", "1")
+    monkeypatch.delenv("DECK_INVENTORY_UV", raising=False)
+
+
+def _fake_check(monkeypatch, outcome, calls=None):
+    def fake(root, launcher, fetch_json, fetch_bytes, run_sync, now):
+        if calls is not None:
+            calls.append({"root": root, "launcher": launcher, "run_sync": run_sync, "now": now})
+        return outcome
+    monkeypatch.setattr(update, "check_and_update", fake)
+
+
+def test_main_messages(main_env, monkeypatch, proj):
+    ui = FakeUI()
+    _fake_check(monkeypatch, update.Outcome("updated", "1.0.0", "1.1.0", "Versione 1.1.0\n• Seconda cosa."))
+    assert update.main(["x", str(proj)], ui) == 0
+    assert len(ui.infos) == 1
+    assert "dalla versione 1.0.0 alla versione 1.1.0" in ui.infos[0]
+    assert "Novità" in ui.infos[0] and "Seconda cosa." in ui.infos[0]
+
+    ui = FakeUI()
+    _fake_check(monkeypatch, update.Outcome("needs_launcher", "1.0.0", "2.0.0"))
+    assert update.main(["x", str(proj)], ui) == 0
+    assert len(ui.infos) == 1
+    assert f"https://github.com/{update.UPDATE_REPO}/releases/latest" in ui.infos[0]
+    assert "versione 2.0.0" in ui.infos[0] and "versione 1.0.0" in ui.infos[0]
+
+    for status in ("current", "skipped", "failed"):
+        ui = FakeUI()
+        _fake_check(monkeypatch, update.Outcome(status, "1.0.0", "1.1.0"))
+        assert update.main(["x", str(proj)], ui) == 0
+        assert ui.infos == []
+
+
+def test_main_passes_launcher_and_root(main_env, monkeypatch, proj):
+    calls = []
+    _fake_check(monkeypatch, update.Outcome("current", "1.0.0"), calls)
+    monkeypatch.setenv("DECK_INVENTORY_LAUNCHER", "3")
+    assert update.main(["x", str(proj)], FakeUI()) == 0
+    assert calls[0]["launcher"] == 3 and Path(calls[0]["root"]) == proj
+    assert isinstance(calls[0]["now"](), str)
+
+    calls.clear()
+    for value in (None, "", "abc"):
+        if value is None:
+            monkeypatch.delenv("DECK_INVENTORY_LAUNCHER")
+        else:
+            monkeypatch.setenv("DECK_INVENTORY_LAUNCHER", value)
+        assert update.main(["x", str(proj)], FakeUI()) == 0
+    assert [c["launcher"] for c in calls] == [0, 0, 0]
+
+
+def test_main_no_dialog_env(main_env, monkeypatch, proj):
+    monkeypatch.setenv("DECK_INVENTORY_NO_DIALOG", "1")
+    for outcome in (update.Outcome("updated", "1.0.0", "1.1.0", "note"),
+                    update.Outcome("needs_launcher", "1.0.0", "2.0.0")):
+        ui = FakeUI()
+        _fake_check(monkeypatch, outcome)
+        assert update.main(["x", str(proj)], ui) == 0
+        assert ui.infos == []
+
+
+def test_main_never_fails(main_env, monkeypatch, proj):
+    def boom(*a, **k):
+        raise RuntimeError("imprevisto")
+    monkeypatch.setattr(update, "check_and_update", boom)
+    assert update.main(["x", str(proj)], FakeUI()) == 0
+    assert "imprevisto" in _error_log(proj)
+
+    class BrokenUI:
+        def info(self, message):
+            raise RuntimeError("niente finestre")
+    _fake_check(monkeypatch, update.Outcome("updated", "1.0.0", "1.1.0", "note"))
+    assert update.main(["x", str(proj)], BrokenUI()) == 0
+    assert "niente finestre" in _error_log(proj)
+
+    assert update.main(["x"], FakeUI()) == 0  # cartella mancante
+
+
+def test_main_missing_uv_means_sync_false(main_env, monkeypatch, proj):
+    calls = []
+    _fake_check(monkeypatch, update.Outcome("current", "1.0.0"), calls)
+    assert update.main(["x", str(proj)], FakeUI()) == 0
+    assert calls[0]["run_sync"](proj / ".app/src") is False
+
+    calls.clear()
+    monkeypatch.setenv("DECK_INVENTORY_UV", str(proj / "uv-inesistente"))
+    assert update.main(["x", str(proj)], FakeUI()) == 0
+    assert calls[0]["run_sync"](proj / ".app/src") is False
+
+
+def test_main_run_sync_command(main_env, monkeypatch, proj):
+    calls, runs = [], []
+
+    class Done:
+        def __init__(self, code):
+            self.returncode = code
+
+    def fake_run(cmd, **kw):
+        runs.append(cmd)
+        return Done(0 if len(runs) == 1 else 1)
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    uv = proj / ".app/runtime/uv/uv"
+    uv.parent.mkdir(parents=True)
+    uv.write_text("", encoding="utf-8")
+    monkeypatch.setenv("DECK_INVENTORY_UV", str(uv))
+    _fake_check(monkeypatch, update.Outcome("current", "1.0.0"), calls)
+    update.main(["x", str(proj)], FakeUI())
+    src = proj / ".app/src"
+    assert calls[0]["run_sync"](src) is True
+    assert calls[0]["run_sync"](src) is False
+    assert runs[0] == [str(uv), "sync", "--project", str(src), "--frozen", "--no-dev"]
