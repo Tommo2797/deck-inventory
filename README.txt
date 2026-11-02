@@ -71,3 +71,12 @@ già uno zip pulito.)
 DISINSTALLARE
 -------------
 Tutto resta dentro questa cartella: per rimuovere ogni cosa basta eliminarla.
+
+NOVITÀ
+------
+Versione 1.1.0
+• Il programma si aggiorna da solo quando esce una versione nuova.
+• Il README contiene lo storico delle versioni (questa sezione).
+
+Versione 1.0.0 (2026-10-31)
+• Prima versione.
