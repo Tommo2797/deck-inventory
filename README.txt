@@ -97,6 +97,7 @@ NOVITÀ
 Versione 1.1.0
 • Il programma si aggiorna da solo quando esce una versione nuova.
 • Il README contiene lo storico delle versioni (questa sezione).
+• Chi ha la 1.0.0 passa alla 1.1.0 a mano, una volta sola (vedi AGGIORNAMENTI nel README).
 
 Versione 1.0.0 (2026-10-31)
 • Prima versione.
