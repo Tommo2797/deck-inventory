@@ -1,0 +1,374 @@
+import hashlib
+import io
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from deck_inventory import update
+from tools.make_share_zip import make_share_zip
+
+ZIP_URL = "https://github.com/esempio/deck-inventory/releases/download/v1.1.0/deck-inventory.zip"
+
+CHANGELOG = """# novità
+== 1.2.0 ==
+- Terza cosa.
+
+== 1.1.0 ==
+- Seconda cosa.
+
+== 1.0.0 (2026-10-31) ==
+- Prima versione.
+"""
+
+USER_FILES = {
+    "settings.txt": "binder = https://x",
+    "decks/x.txt": "Legend:\n1 X",
+    "Inventory a.html": "<html>",
+    "Start (Mac).command": "#!/bin/bash\necho vecchio\n",
+}
+
+
+def _write_project(base: Path, version: str, min_launcher: int | None = None,
+                   changelog: str = CHANGELOG, readme: str | None = None) -> Path:
+    init = f'VERSION = "{version}"\n'
+    if min_launcher is not None:
+        init += f"MIN_LAUNCHER = {min_launcher}\n"
+    init += 'UPDATE_REPO = "esempio/deck-inventory"\n'
+    files = {
+        ".app/src/deck_inventory/__init__.py": init,
+        ".app/src/deck_inventory/modulo.py": f"# codice {version}\n",
+        ".app/src/CHANGELOG.txt": changelog,
+        ".app/src/pyproject.toml": f'[project]\nname = "x"\n# {version}\n',
+        "README.txt": f"README {version}\n" if readme is None else readme,
+        **USER_FILES,
+    }
+    for rel, content in files.items():
+        p = base / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    return base
+
+
+def _release_zip(tmp_path: Path, version: str, **kw) -> bytes:
+    src = _write_project(tmp_path / f"rel-{version}-{len(kw)}", version, **kw)
+    (src / "README.txt").write_text(f"README NUOVO {version}\n", encoding="utf-8")
+    out = tmp_path / f"rel-{version}-{len(kw)}.zip"
+    make_share_zip(src, out)
+    return out.read_bytes()
+
+
+def _snapshot(root: Path) -> dict[str, str]:
+    """Hash di tutti i file del progetto, escluso .app/runtime."""
+    out = {}
+    for p in sorted(root.rglob("*")):
+        rel = p.relative_to(root).as_posix()
+        if p.is_file() and not rel.startswith(".app/runtime"):
+            out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def _api(tag: str = "v1.1.0", url: str = ZIP_URL):
+    data = {"tag_name": tag, "assets": [{"name": "deck-inventory.zip", "browser_download_url": url}]}
+    return lambda u: data
+
+
+class Sync:
+    def __init__(self, results=(True,)):
+        self.results = list(results)
+        self.calls: list[Path] = []
+
+    def __call__(self, src: Path) -> bool:
+        self.calls.append(src)
+        return self.results.pop(0) if self.results else True
+
+
+def _now():
+    return "2026-11-02 12:00:00"
+
+
+@pytest.fixture(autouse=True)
+def _no_env_and_no_wait(monkeypatch):
+    monkeypatch.delenv("DECK_INVENTORY_UPDATE_API", raising=False)
+    monkeypatch.setattr(update, "_sleep", lambda s: None)
+
+
+@pytest.fixture
+def proj(tmp_path):
+    return _write_project(tmp_path / "Deck Inventory", "1.0.0")
+
+
+def _run(proj, data: bytes | None = None, *, launcher=1, fetch_json=None, sync=None):
+    def fetch_bytes(url):
+        assert url == ZIP_URL
+        if data is None:
+            raise AssertionError("download non previsto")
+        return data
+    return update.check_and_update(proj, launcher, fetch_json or _api(), fetch_bytes,
+                                   sync or Sync(), _now)
+
+
+def _error_log(proj) -> str:
+    log = proj / ".app/runtime/last-error.log"
+    return log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+# --- salti ---------------------------------------------------------------
+
+def test_git_folder_skips(proj):
+    (proj / ".git").mkdir()
+    before = _snapshot(proj)
+    out = _run(proj)
+    assert out.status == "skipped"
+    assert _snapshot(proj) == before
+
+
+def test_no_launcher_env_skips(proj):
+    before = _snapshot(proj)
+    assert _run(proj, launcher=0).status == "skipped"
+    assert _snapshot(proj) == before
+
+
+def _raise(url):
+    raise OSError("rete assente")
+
+
+@pytest.mark.parametrize("fetch_json", [
+    _raise,
+    lambda u: {},
+    lambda u: {"tag_name": "latest", "assets": []},
+    lambda u: {"tag_name": "v1.1.0", "assets": []},
+    lambda u: {"tag_name": "v1.1.0", "assets": [{"name": "altro.zip", "browser_download_url": ZIP_URL}]},
+    lambda u: {"tag_name": "v1.1.0", "assets": [{"name": "deck-inventory.zip",
+                                                 "browser_download_url": "http://x/deck-inventory.zip"}]},
+])
+def test_api_errors_skip(proj, fetch_json):
+    before = _snapshot(proj)
+    out = _run(proj, fetch_json=fetch_json)
+    assert out.status == "skipped"
+    assert _snapshot(proj) == before
+
+
+def test_latest_release_uses_repo_url_and_env_override(monkeypatch):
+    seen = []
+
+    def fetch(url):
+        seen.append(url)
+        return {"tag_name": "v1.2.3", "assets": [{"name": "deck-inventory.zip", "browser_download_url": ZIP_URL}]}
+
+    rel = update.latest_release(fetch)
+    assert rel == update.Release("1.2.3", ZIP_URL)
+    assert seen[-1] == update.API_URL.format(repo=update.UPDATE_REPO)
+    # Con l'override (solo test manuali) anche un URL http locale è accettato.
+    monkeypatch.setenv("DECK_INVENTORY_UPDATE_API", "http://127.0.0.1:8000/latest.json")
+    local = "http://127.0.0.1:8000/deck-inventory.zip"
+    rel = update.latest_release(lambda u: seen.append(u) or
+                                {"tag_name": "1.2.3", "assets": [{"name": "deck-inventory.zip",
+                                                                  "browser_download_url": local}]})
+    assert seen[-1] == "http://127.0.0.1:8000/latest.json"
+    assert rel == update.Release("1.2.3", local)
+
+
+@pytest.mark.parametrize("tag", ["v1.0.0", "v0.9.9"])
+def test_same_or_older_is_current(proj, tag):
+    before = _snapshot(proj)
+    out = _run(proj, fetch_json=_api(tag))
+    assert out.status == "current"
+    assert out.old == "1.0.0"
+    assert _snapshot(proj) == before
+
+
+# --- aggiornamento riuscito ----------------------------------------------
+
+def test_update_success(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0")
+    user_before = {k: v for k, v in _snapshot(proj).items() if not k.startswith(".app/") and k != "README.txt"}
+    sync = Sync()
+    out = _run(proj, data, sync=sync)
+    assert out.status == "updated", _error_log(proj)
+    assert (out.old, out.new) == ("1.0.0", "1.1.0")
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+    assert (proj / ".app/src/deck_inventory/modulo.py").read_text(encoding="utf-8") == "# codice 1.1.0\n"
+    assert (proj / "README.txt").read_text(encoding="utf-8") == "README NUOVO 1.1.0\n"
+    after = _snapshot(proj)
+    for rel, digest in user_before.items():
+        assert after[rel] == digest, rel
+    assert "1.1.0" in out.notes and "Seconda cosa." in out.notes
+    assert "1.0.0" not in out.notes and "1.2.0" not in out.notes
+    assert sync.calls == [proj / ".app/src"]
+    upd = proj / ".app/runtime/update"
+    assert not (upd / "staging").exists()
+    assert not (upd / "previous").exists()
+    # Al secondo avvio non c'è più niente da fare.
+    assert _run(proj).status == "current"
+
+
+def test_skipped_versions_notes(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.2.0")
+    out = _run(proj, data, fetch_json=_api("v1.2.0"))
+    assert out.status == "updated", _error_log(proj)
+    assert out.notes.index("Versione 1.2.0") < out.notes.index("Versione 1.1.0")
+    assert "Prima versione." not in out.notes
+
+
+def test_bad_changelog_still_updates(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0", changelog="== 1.1.0 ==\nriga senza trattino\n")
+    out = _run(proj, data)
+    assert out.status == "updated"
+    assert out.notes == ""
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+    assert "CHANGELOG" in _error_log(proj)
+
+
+def test_rename_fallback_to_copy(proj, tmp_path, monkeypatch):
+    """Simula Windows: la rinomina fallisce sempre → copia + rimozione."""
+    calls = []
+
+    def locked(src, dst):
+        calls.append(src)
+        raise PermissionError("file in uso")
+
+    monkeypatch.setattr(update, "_rename", locked)
+    data = _release_zip(tmp_path, "1.1.0")
+    out = _run(proj, data)
+    assert out.status == "updated", _error_log(proj)
+    assert len(calls) == 2 * update.MOVE_ATTEMPTS
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+    assert not (proj / ".app/runtime/update/previous").exists()
+
+
+def test_move_retries_then_renames(tmp_path, monkeypatch):
+    real = update._rename
+    failures = [PermissionError("in uso")] * 3
+    sleeps = []
+
+    def flaky(src, dst):
+        if failures:
+            raise failures.pop()
+        real(src, dst)
+
+    monkeypatch.setattr(update, "_rename", flaky)
+    monkeypatch.setattr(update, "_sleep", sleeps.append)
+    monkeypatch.setattr(update.shutil, "copytree", lambda *a, **k: pytest.fail("ripiego non previsto"))
+    src = tmp_path / "a"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub/f.txt").write_text("x")
+    update._move(src, tmp_path / "b")
+    assert (tmp_path / "b/sub/f.txt").read_text() == "x"
+    assert not src.exists()
+    assert sleeps == [update.MOVE_DELAY] * 3
+
+
+# --- fallimenti: resta la versione vecchia --------------------------------
+
+def _zip_with(entries: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, content in entries.items():
+            zf.writestr(name, content)
+    return buf.getvalue()
+
+
+def _good_entries(version="1.1.0"):
+    return {
+        "Deck Inventory/README.txt": "nuovo",
+        "Deck Inventory/.app/src/pyproject.toml": "x",
+        "Deck Inventory/.app/src/CHANGELOG.txt": CHANGELOG,
+        "Deck Inventory/.app/src/deck_inventory/__init__.py": f'VERSION = "{version}"\n',
+    }
+
+
+@pytest.mark.parametrize("make", [
+    lambda good: good[: len(good) // 2],
+    lambda good: _zip_with({**_good_entries(), "../evil.txt": "x"}),
+    lambda good: _zip_with({**_good_entries(), "Deck Inventory/../../../../evil.txt": "x"}),
+    lambda good: _zip_with({**_good_entries(), "/tmp/evil.txt": "x"}),
+    lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("__init__.py")}),
+    lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("README.txt")}),
+    lambda good: _zip_with({k: v for k, v in _good_entries().items() if not k.endswith("pyproject.toml")}),
+], ids=["troncato", "dotdot", "dotdot-annidato", "assoluto", "senza-init", "senza-readme", "senza-pyproject"])
+def test_bad_zip_keeps_old(proj, tmp_path, make):
+    data = make(_release_zip(tmp_path, "1.1.0"))
+    before = _snapshot(proj)
+    sync = Sync()
+    out = _run(proj, data, sync=sync)
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert sync.calls == []
+    log = _error_log(proj)
+    assert "2026-11-02 12:00:00" in log and "1.1.0" in log
+    assert not any(p.name == "evil.txt" for p in tmp_path.rglob("*"))
+    assert not Path("/tmp/evil.txt").exists() or Path("/tmp/evil.txt").read_text() != "x"
+
+
+def test_sync_failure_rolls_back(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+    sync = Sync([False, True])
+    out = _run(proj, data, sync=sync)
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert (proj / "README.txt").read_text(encoding="utf-8") == "README 1.0.0\n"
+    assert sync.calls == [proj / ".app/src"] * 2
+    assert "sync" in _error_log(proj)
+    assert not (proj / ".app/runtime/update/previous").exists()
+
+
+def test_exception_after_swap_rolls_back(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+    calls = []
+
+    def sync(src):
+        calls.append(src)
+        if len(calls) == 1:
+            raise OSError("disco pieno")
+        return True
+
+    out = _run(proj, data, sync=sync)
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert len(calls) == 2  # risincronizza la versione rimessa a posto
+    assert "disco pieno" in _error_log(proj)
+
+
+def test_needs_launcher_once(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.1.0", min_launcher=2)
+    before = _snapshot(proj)
+    out = _run(proj, data)
+    assert out.status == "needs_launcher"
+    assert out.new == "1.1.0"
+    assert _snapshot(proj) == before
+    assert (proj / ".app/runtime/update/notified-1.1.0").exists()
+    out = _run(proj)  # nessun download la seconda volta
+    assert out.status == "current"
+    assert _snapshot(proj) == before
+
+
+def test_version_mismatch_fails(proj, tmp_path):
+    data = _release_zip(tmp_path, "1.2.0")
+    before = _snapshot(proj)
+    out = _run(proj, data, fetch_json=_api("v1.1.0"))
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+
+
+# --- funzioni di supporto -------------------------------------------------
+
+def test_read_meta(tmp_path):
+    _write_project(tmp_path, "2.3.4")
+    assert update.read_meta(tmp_path / ".app/src") == ("2.3.4", 1)
+    _write_project(tmp_path, "2.3.4", min_launcher=3)
+    assert update.read_meta(tmp_path / ".app/src") == ("2.3.4", 3)
+
+
+def test_log_error_appends(tmp_path):
+    update.log_error(tmp_path, "uno")
+    update.log_error(tmp_path, "due")
+    assert (tmp_path / ".app/runtime/last-error.log").read_text(encoding="utf-8") == "uno\ndue\n"
+
+
+def test_module_has_no_ui_imports():
+    text = Path(update.__file__).read_text(encoding="utf-8")
+    for name in ("tkinter", "playwright", "dialogs", "deck_inventory.main"):
+        assert f"import {name}" not in text and f"from {name}" not in text
