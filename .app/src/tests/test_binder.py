@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from deck_inventory import VERSION, browsers
+from deck_inventory import binder
 from deck_inventory.binder import _flight_text, fetch_collection, parse_payloads
 from deck_inventory.errors import (
     BinderPrivateError,
@@ -107,6 +108,72 @@ def test_all_zero_quantities_is_empty_binder():
     )
     with pytest.raises(EmptyBinderError):
         parse_payloads([payload])
+
+
+# --- binder inesistente ------------------------------------------------------
+
+_MISSING_HTML = "<html><head><title>User Not Found | Piltover Archive</title></head></html>"
+
+
+def test_not_found_title_in_html_is_private_without_waiting():
+    def never(ms):
+        raise AssertionError("niente attesa: il <title> basta")
+    with pytest.raises(BinderPrivateError):
+        binder._raise_not_found(_MISSING_HTML, never, 90_000)
+
+
+@pytest.mark.parametrize("visible, error", [(True, BinderPrivateError), (False, SiteChangedError)])
+def test_not_found_waits_for_heading(visible, error):
+    waits = []
+    with pytest.raises(error):
+        binder._raise_not_found("<html><title>Altro</title></html>",
+                                lambda ms: waits.append(ms) or visible, 90_000)
+    assert waits == [binder._NOT_FOUND_WAIT_MS]
+
+
+def test_not_found_wait_bounded_by_deadline():
+    waits = []
+    with pytest.raises(SiteChangedError):
+        binder._raise_not_found("", lambda ms: waits.append(ms) or False, 1200)
+    with pytest.raises(SiteChangedError):
+        binder._raise_not_found("", lambda ms: waits.append(ms) or False, -5)
+    assert waits == [1200, 1]
+
+
+class _FakeLocator:
+    def __init__(self, exc=None):
+        self.exc, self.calls = exc, []
+
+    @property
+    def first(self):
+        return self
+
+    def wait_for(self, **kw):
+        self.calls.append(kw)
+        if self.exc:
+            raise self.exc
+
+
+class _FakePage:
+    def __init__(self, locator):
+        self.locator = locator
+
+    def get_by_role(self, role, name):
+        assert (role, name) == ("heading", "User Not Found")
+        return self.locator
+
+
+def test_heading_visible_waits_and_maps_timeout():
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    loc = _FakeLocator()
+    assert binder._heading_visible(_FakePage(loc), 5000) is True
+    assert loc.calls == [{"state": "visible", "timeout": 5000}]
+    # Il timeout dell'attesa non diventa un errore di rete (è un sottotipo di Error).
+    assert binder._heading_visible(_FakePage(_FakeLocator(PlaywrightTimeoutError("t"))), 5000) is False
+    with pytest.raises(PlaywrightError):
+        binder._heading_visible(_FakePage(_FakeLocator(PlaywrightError("chiuso"))), 5000)
 
 
 def _launch():
