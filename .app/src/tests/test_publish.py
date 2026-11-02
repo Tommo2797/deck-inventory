@@ -14,6 +14,12 @@ CHANGELOG = (
     "== 1.0.0 (2026-10-31) ==\n- Prima versione.\n"
 )
 README = "DECK INVENTORY\n\nNOVITÀ\n------\nvecchio\n"
+FAKE_UV = "/finto/uv"
+
+
+@pytest.fixture(autouse=True)
+def _uv_in_use(monkeypatch):
+    monkeypatch.setenv("UV", FAKE_UV)
 
 
 def test_check_version():
@@ -52,10 +58,12 @@ def _project(tmp_path):
     files = {
         ".app/src/deck_inventory/__init__.py": INIT,
         ".app/src/CHANGELOG.txt": CHANGELOG,
+        ".app/src/pyproject.toml": "[project]\n",
+        ".app/src/uv.lock": "x",
         ".app/src/tests/private/x.csv": "x",
         "README.txt": README,
         "settings.txt": f"binder = {DUMMY_BINDER}\n",
-        "Start (Mac).command": "#!/bin/bash\n",
+        "Start (Mac).command": '#!/bin/bash\n\nUV_VERSION="0.13.1"\n',
     }
     for rel, text in files.items():
         p = root / rel
@@ -67,10 +75,11 @@ def _project(tmp_path):
 class FakeSh:
     """Esegue finto: registra i comandi e risponde come git/gh in uno stato sano."""
 
-    def __init__(self, porcelain="", login="Tommo2797", latest="v1.0.0", fail_on=None):
+    def __init__(self, porcelain="", login="Tommo2797", latest="v1.0.0", fail_on=None, uv="0.13.1"):
         self.calls: list[list[str]] = []
         self.envs: list[str | None] = []
         self.porcelain, self.login, self.latest, self.fail_on = porcelain, login, latest, fail_on
+        self.uv = uv
 
     def __call__(self, cmd):
         import os
@@ -86,6 +95,8 @@ class FakeSh:
             return self.porcelain
         if cmd[:2] == ["git", "rev-parse"]:
             return "abc123\n"
+        if cmd == [FAKE_UV, "--version"]:
+            return f"uv {self.uv} (62faed335 2026-10-13 aarch64-apple-darwin)\n"
         if cmd[:3] == ["gh", "api", "user"]:
             return self.login + "\n"
         if cmd[:3] == ["gh", "release", "view"]:
@@ -270,3 +281,82 @@ def test_share_zip_excludes_publish_tools(tmp_path):
         "Deck Inventory/.app/src/tools/make_share_zip.py",
         "Deck Inventory/decks/order.txt",
     }
+
+
+def test_launcher_uv_version(tmp_path):
+    root = _project(tmp_path)
+    assert publish.launcher_uv_version(root) == "0.13.1"
+    (root / "Start (Mac).command").write_text("#!/bin/bash\n", encoding="utf-8")
+    with pytest.raises(publish.Refused):
+        publish.launcher_uv_version(root)
+
+
+def test_real_launcher_uv_version_is_readable():
+    assert publish.launcher_uv_version(publish.ROOT) == "0.13.1"
+
+
+def test_run_refuses_other_uv_version(tmp_path, capsys):
+    root = _project(tmp_path)
+    sh = FakeSh(uv="0.14.0")
+    assert publish.run(["1.1.0", "--dry-run"], sh, root=root) == 1
+    out = capsys.readouterr().out
+    assert "0.14.0" in out and "0.13.1" in out
+    assert not any("pytest" in c for call in sh.calls for c in call)
+
+
+def test_run_refuses_unknown_uv(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("UV")
+    root = _project(tmp_path)
+    assert publish.run(["1.1.0", "--dry-run"], FakeSh(), root=root) == 1
+    assert "publish.sh" in capsys.readouterr().out
+
+
+def _zip(tmp_path, init=INIT, drop=()):
+    root = _project(tmp_path / "z")
+    (root / ".app/src/deck_inventory/__init__.py").write_text(init, encoding="utf-8")
+    for rel in drop:
+        (root / rel).unlink()
+    out = tmp_path / "z.zip"
+    make_share_zip(root, out)
+    return out
+
+
+def test_check_zip(tmp_path):
+    publish.check_zip(_zip(tmp_path), "1.0.0")
+    publish.check_zip(_zip(tmp_path), None)
+    with pytest.raises(publish.Refused, match="1.0.0"):
+        publish.check_zip(_zip(tmp_path), "1.1.0")
+    with pytest.raises(publish.Refused, match="installabile"):
+        publish.check_zip(_zip(tmp_path, drop=[".app/src/uv.lock"]), None)
+    with pytest.raises(publish.Refused, match="MIN_LAUNCHER"):
+        publish.check_zip(_zip(tmp_path, init=INIT.replace("MIN_LAUNCHER = 1", "MIN_LAUNCHER = 0")), None)
+    with pytest.raises(publish.Refused, match="installabile"):
+        publish.check_zip(_zip(tmp_path, init="MIN_LAUNCHER = 1\n"), None)
+
+
+def test_run_refuses_uninstallable_zip_before_any_git_change(tmp_path, capsys):
+    root = _project(tmp_path)
+    (root / ".app/src/uv.lock").unlink()
+    sh = FakeSh()
+    assert publish.run(["1.1.0"], sh, root=root) == 1
+    assert "installabile" in capsys.readouterr().out
+    assert not sh.has("git", "commit") and not sh.has("gh", "release", "create")
+
+
+def test_release_zip_checked_with_new_version(tmp_path, monkeypatch):
+    root = _project(tmp_path)
+    checked = []
+    real = publish.check_zip
+    monkeypatch.setattr(publish, "check_zip", lambda z, v: (checked.append(v), real(z, v)))
+    sh = FakeSh()
+    assert publish.run(["1.1.0"], sh, root=root) == 0
+    assert checked == [None, "1.1.0"]
+
+
+def test_release_refused_if_zip_has_wrong_version(tmp_path, monkeypatch, capsys):
+    root = _project(tmp_path)
+    monkeypatch.setattr(publish, "bump_version", lambda text, new: text)  # VERSION non alzata
+    sh = FakeSh()
+    assert publish.run(["1.1.0"], sh, root=root) == 1
+    assert "non la 1.1.0" in capsys.readouterr().out
+    assert not sh.has("gh", "release", "create")

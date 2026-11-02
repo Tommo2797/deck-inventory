@@ -3,8 +3,9 @@
 Uso: .app/src/tools/publish.sh <versione> [--skip-online] [--dry-run]
 
 Controlla tutto prima di toccare qualcosa (ramo main allineato e pulito, account gh,
-versione, voce nel CHANGELOG, test normali + privati + dal vivo), poi aggiorna VERSION,
-CHANGELOG e README, crea commit e tag, li carica e crea la release con lo zip.
+uv uguale a quello dei launcher, versione, voce nel CHANGELOG, test normali + privati
++ dal vivo), poi aggiorna VERSION, CHANGELOG e README, crea commit e tag, li carica e
+crea la release con lo zip (prima verificato come lo installerebbe l'aggiornamento).
 Il link del binder (da settings.txt) serve solo al test dal vivo: non viene mai
 stampato né scritto da nessuna parte.
 """
@@ -21,7 +22,7 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from deck_inventory import UPDATE_REPO, changelog  # noqa: E402
+from deck_inventory import UPDATE_REPO, changelog, update  # noqa: E402
 from deck_inventory.errors import SettingsError  # noqa: E402
 from deck_inventory.settings import read_link  # noqa: E402
 from tools.make_share_zip import make_share_zip  # noqa: E402
@@ -29,7 +30,9 @@ from tools.make_share_zip import make_share_zip  # noqa: E402
 ROOT = Path(__file__).resolve().parents[3]
 ZIP_NAME = "deck-inventory.zip"
 BINDER_ENV = "DECK_INVENTORY_TEST_BINDER"
+MAC_LAUNCHER = "Start (Mac).command"
 _VERSION_LINE = re.compile(r'^VERSION = "[^"]*"$', re.MULTILINE)
+_UV_VERSION_LINE = re.compile(r'^UV_VERSION="([^"]+)"', re.MULTILINE)
 
 Sh = Callable[[list[str]], str]
 
@@ -65,6 +68,35 @@ def release_notes(changelog_text: str, version: str) -> str:
                 raise ValueError(f"Nel CHANGELOG la voce {version} non ha novità.")
             return changelog.format_entries([entry])
     raise ValueError(f"Nel CHANGELOG manca la voce == {version} ==.")
+
+
+def launcher_uv_version(root: Path) -> str:
+    """La versione di uv fissata nei launcher (letta dal launcher Mac, unica fonte)."""
+    try:
+        text = (root / MAC_LAUNCHER).read_text(encoding="utf-8")
+    except OSError as e:
+        raise Refused(f"Non riesco a leggere {MAC_LAUNCHER}: {e}")
+    m = _UV_VERSION_LINE.search(text)
+    if not m:
+        raise Refused(f"In {MAC_LAUNCHER} manca la riga UV_VERSION=\"...\".")
+    return m.group(1)
+
+
+def check_zip(zip_path: Path, version: str | None) -> None:
+    """Lo zip passa gli stessi controlli dell'aggiornamento automatico.
+
+    `version` None (prova): solo struttura e MIN_LAUNCHER, la versione non è ancora alzata.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            rel_root = update.extract_release(Path(zip_path).read_bytes(), Path(tmp))
+            got, min_launcher = update.read_meta(rel_root / ".app" / "src")
+        except (update.UpdateError, OSError) as e:
+            raise Refused(f"Lo zip della release non sarebbe installabile dall'aggiornamento: {e}")
+    if version is not None and got != version:
+        raise Refused(f"Lo zip contiene la versione {got}, non la {version}.")
+    if not isinstance(min_launcher, int) or min_launcher < 1:
+        raise Refused(f"Nello zip MIN_LAUNCHER vale {min_launcher!r}: deve essere un intero >= 1.")
 
 
 def _today() -> str:
@@ -110,6 +142,19 @@ def _check_gh(sh: Sh) -> None:
     login = _call(sh, ["gh", "api", "user", "-q", ".login"], "Leggere l'account gh (gh auth login?)").strip()
     if login != owner:
         raise Refused(f"gh è collegato all'account {login!r}, ma il repository {UPDATE_REPO} è di {owner!r}.")
+
+
+def _check_uv(sh: Sh, root: Path) -> None:
+    """uv.lock si scrive con l'uv in uso: deve essere quello dei launcher, che non cambia mai."""
+    want = launcher_uv_version(root)
+    uv = os.environ.get("UV", "").strip()  # impostata da `uv run` (publish.sh)
+    if not uv:
+        raise Refused("Non so quale uv è in uso: avvia con .app/src/tools/publish.sh.")
+    words = _call(sh, [uv, "--version"], "Leggere la versione di uv").split()
+    got = words[1] if len(words) > 1 else "?"
+    if got != want:
+        raise Refused(f"Stai usando uv {got}, ma i launcher usano uv {want} (UV_VERSION in {MAC_LAUNCHER}): "
+                      f"uv.lock deve funzionare con quella. Usa uv {want}.")
 
 
 def _latest_release(sh: Sh) -> str | None:
@@ -191,6 +236,7 @@ def _release(sh: Sh, root: Path, version: str, notes_today: str) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             zip_path = Path(tmp) / ZIP_NAME
             make_share_zip(root, zip_path)
+            check_zip(zip_path, version)
             _call(sh, ["gh", "release", "create", tag, str(zip_path), "--repo", UPDATE_REPO,
                        "--title", f"Deck Inventory {version}", "--notes", notes], "gh release create")
 
@@ -207,6 +253,7 @@ def run(argv: list[str], sh: Sh, root: Path = ROOT) -> int:
     try:
         _check_git(sh)
         _check_gh(sh)
+        _check_uv(sh, root)
         latest = _latest_release(sh)
         try:
             check_version(version, latest)
@@ -215,11 +262,15 @@ def run(argv: list[str], sh: Sh, root: Path = ROOT) -> int:
             raise Refused(str(e))
         _run_tests(sh, root, args.skip_online)
 
+        # Prova dello zip prima di qualunque commit/tag/push; dopo l'aumento di
+        # versione si ricrea e si ricontrolla (anche la versione) prima della release.
+        with tempfile.TemporaryDirectory() as tmp:
+            zip_path = Path(tmp) / ZIP_NAME
+            make_share_zip(root, zip_path)
+            check_zip(zip_path, None)
+            size = zip_path.stat().st_size
+
         if args.dry_run:
-            with tempfile.TemporaryDirectory() as tmp:
-                zip_path = Path(tmp) / ZIP_NAME
-                make_share_zip(root, zip_path)
-                size = zip_path.stat().st_size
             print(f"\nProva (--dry-run): tutti i controlli sono passati. Ultima release: {latest or 'nessuna'}.")
             print(f"Pubblicando {tag} farebbe:")
             print(f"  1. VERSION = \"{version}\", data di oggi ({_today()}) nel CHANGELOG, sezione NOVITÀ del README")
