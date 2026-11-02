@@ -161,12 +161,16 @@ def _move(src: Path, dst: Path) -> None:
         return
     except OSError:
         pass
-    created = not dst.exists()
+    # La copia va in `<dst>.partial` e prende il nome finale solo quando è finita:
+    # una `dst` che esiste è sempre completa, anche se il programma viene chiuso a metà.
+    tmp = _partial(dst)
+    shutil.rmtree(tmp, ignore_errors=True)
     try:
-        shutil.copytree(src, dst)
+        shutil.copytree(src, tmp)
+        # Copia appena creata: nessuno la tiene aperta (il blocco riguarda `src`).
+        _retry(lambda: os.rename(tmp, dst))
     except BaseException:
-        if created:
-            shutil.rmtree(dst, ignore_errors=True)  # niente copie a metà
+        shutil.rmtree(tmp, ignore_errors=True)
         raise
     try:
         _retry(lambda: shutil.rmtree(src))
@@ -174,6 +178,10 @@ def _move(src: Path, dst: Path) -> None:
         # Rimozione interrotta da un file bloccato: rimette in `src` quanto già cancellato.
         shutil.copytree(dst, src, dirs_exist_ok=True)
         raise
+
+
+def _partial(path: Path) -> Path:
+    return path.with_name(path.name + ".partial")
 
 
 def _remove(path: Path) -> None:
@@ -288,6 +296,7 @@ def check_and_update(root: Path, launcher: int,
         readme_replaced = True
         if not run_sync(src):
             raise UpdateError("uv sync non riuscito con la nuova versione")
+        marker.unlink()  # scambio concluso: da qui in poi niente ripristino
     except Exception as e:
         log(f"installazione della {new} non riuscita, resta la {old}: {e!r}")
         restored = True
@@ -311,7 +320,6 @@ def check_and_update(root: Path, launcher: int,
     except Exception as e:
         log(f"CHANGELOG della {new} illeggibile, note omesse: {e!r}")
         notes = ""
-    marker.unlink(missing_ok=True)
     _cleanup(staging, previous)
     return Outcome("updated", old, new, notes)
 
@@ -326,8 +334,11 @@ def _recover(src, previous, marker, readme, log, sync) -> None:
 
 
 def _settle(src: Path, previous: Path, marker: Path, *extra: Path) -> None:
-    """Pulisce solo se `.app/src` è completa; altrimenti lascia tutto per il prossimo avvio."""
-    _cleanup(*extra)
+    """Pulisce solo se `.app/src` è completa; altrimenti lascia tutto per il prossimo avvio.
+
+    Le copie `.partial` non sono mai affidabili e si eliminano sempre.
+    """
+    _cleanup(_partial(src), _partial(previous), *extra)
     if _complete(src):
         marker.unlink(missing_ok=True)
         _cleanup(previous)

@@ -440,18 +440,59 @@ def test_partial_copy_of_old_src_is_never_restored(proj, tmp_path, monkeypatch):
         (Path(dst) / "pyproject.toml").write_text("parziale")
         raise OSError("disco pieno")
 
+    partial = proj / ".app/runtime/update/previous.partial"
     monkeypatch.setattr(update, "_rename", _always_locked_rename)
     monkeypatch.setattr(update.shutil, "copytree", broken_copytree)
-    _lock(monkeypatch, prev / "pyproject.toml")
+    _lock(monkeypatch, partial / "pyproject.toml")
     out = _run(proj, data)
     monkeypatch.undo()
     assert out.status == "failed"
     assert _snapshot(proj) == before
-    assert not (proj / ".app/runtime/update/swap-in-progress").exists()
+    assert not prev.exists()  # la copia a metà non prende mai il nome `previous`
+    assert partial.exists()  # non cancellabile (file bloccato)
     # Al prossimo avvio la copia parziale rimasta viene solo eliminata.
     assert update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now).status == "current"
     assert _snapshot(proj) == before
-    assert not prev.exists()
+    assert not partial.exists()
+
+
+def test_killed_during_copy_fallback_keeps_good_src(proj):
+    """Chiuso durante la copia src→previous.partial: al riavvio src resta, la copia sparisce."""
+    import shutil
+    before = _snapshot(proj)
+    upd = proj / ".app/runtime/update"
+    partial = upd / "previous.partial"
+    shutil.copytree(proj / ".app/src", partial)  # sembra completa, ma è .partial
+    (partial / "deck_inventory/modulo.py").unlink()
+    (upd / "swap-in-progress").touch()
+    sync = Sync()
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, sync, _now)
+    assert out.status == "current"
+    assert _snapshot(proj) == before
+    assert not partial.exists() and not (upd / "previous").exists()
+    assert not (upd / "swap-in-progress").exists()
+    assert sync.calls == []
+
+
+def test_killed_after_successful_swap_keeps_new_version(proj, tmp_path, monkeypatch):
+    """Chiuso dopo un uv sync riuscito ma prima della pulizia: niente ripristino."""
+    data = _release_zip(tmp_path, "1.1.0")
+
+    def killed(*a):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(update, "_notes", killed)
+    with pytest.raises(KeyboardInterrupt):
+        _run(proj, data)
+    monkeypatch.undo()
+    upd = proj / ".app/runtime/update"
+    assert (upd / "previous").exists() and not (upd / "swap-in-progress").exists()
+    sync = Sync()
+    out = update.check_and_update(proj, 1, _api("v1.1.0"), None, sync, _now)
+    assert out.status == "current" and out.old == "1.1.0"
+    assert '"1.1.0"' in (proj / ".app/src/deck_inventory/__init__.py").read_text(encoding="utf-8")
+    assert not (upd / "previous").exists()
+    assert sync.calls == []
 
 
 def _interrupted(proj, *, src_state: str):
