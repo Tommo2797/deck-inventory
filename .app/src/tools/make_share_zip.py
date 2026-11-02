@@ -1,7 +1,7 @@
 """Crea lo zip da condividere: python make_share_zip.py <cartella_progetto> <out.zip>
 
 Esclude runtime, impostazioni, pagine generate, mazzi personali e file di sviluppo
-(test compresi).
+(test, ambienti .venv e strumenti di pubblicazione dell'autore compresi).
 Dentro lo zip mette un decks/order.txt di esempio (solo commenti).
 """
 import fnmatch
@@ -15,8 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deck_inventory.decks import _ORDER_HEADER  # noqa: E402
 
 ROOT_NAME = "Deck Inventory"
-EXCLUDED_DIRS = {".git", ".superpowers", "__pycache__", ".pytest_cache"}
-EXCLUDED_PATHS = {".app/runtime", ".app/src/tests", "decks", "docs", "settings.txt", ".gitignore", ".gitattributes"}
+EXCLUDED_DIRS = {".git", ".superpowers", "__pycache__", ".pytest_cache", ".venv"}
+EXCLUDED_PATHS = {
+    ".app/runtime", ".app/src/tests", "decks", "docs", "settings.txt", ".gitignore", ".gitattributes",
+    ".app/src/tools/publish.py", ".app/src/tools/publish.sh",
+}
 EXCLUDED_NAMES = {".DS_Store"}
 EXCLUDED_PATTERNS = ["Inventory *.html"]
 FIXED_DATE = (2026, 1, 1, 0, 0, 0)

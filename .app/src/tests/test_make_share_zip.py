@@ -28,6 +28,8 @@ def _build(tmp_path):
         ".app/src/tests/test_a.py": "x",
         ".app/src/tests/fixtures/decks/f.txt": "x",
         ".app/src/.pytest_cache/v": "x",
+        ".venv/bin/python": "x",
+        ".app/src/.venv/lib/site.py": "x",
     }
     for rel, content in files.items():
         p = proj / rel

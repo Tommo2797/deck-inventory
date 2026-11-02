@@ -7,3 +7,4 @@ __pycache__/
 /.superpowers/
 .DS_Store
 /.app/src/tests/private/
+.venv/

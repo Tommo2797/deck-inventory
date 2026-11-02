@@ -2,6 +2,12 @@
 
 Avvio (dai launcher, prima del programma): python -m deck_inventory.update <cartella del progetto>
 
+Contratto fisso con i launcher (che non si aggiornano mai): chiamano
+`python -m deck_inventory.update <ROOT>` e passano le variabili d'ambiente
+DECK_INVENTORY_LAUNCHER (numero di versione del launcher) e DECK_INVENTORY_UV
+(percorso di uv). Le versioni future devono mantenere questo percorso di modulo
+e questi nomi; se i launcher devono cambiare, alzare MIN_LAUNCHER.
+
 Tocca solo `.app/src/` e `README.txt`. Scambio delle cartelle con rollback:
 o si installa tutta la versione nuova o resta quella di prima. Non solleva mai.
 Solo standard library: deve funzionare anche se il resto del programma è rotto.

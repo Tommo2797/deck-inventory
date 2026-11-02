@@ -74,6 +74,24 @@ DISINSTALLARE
 -------------
 Tutto resta dentro questa cartella: per rimuovere ogni cosa basta eliminarla.
 
+AGGIORNAMENTI
+-------------
+Deck Inventory si aggiorna da solo: a ogni avvio controlla se è uscita una
+versione nuova e, se c'è, la installa e ti mostra le novità. I tuoi mazzi,
+il link del binder e le pagine "Inventory ....html" non vengono toccati.
+Senza internet usa semplicemente la versione che ha.
+
+Se hai la versione 1.0.0 devi passare alla 1.1.0 a mano, una volta sola:
+1. Scarica "deck-inventory.zip" da
+   https://github.com/Tommo2797/deck-inventory/releases/latest
+2. Estrailo in una cartella nuova (non sopra quella vecchia).
+3. Copia nella cartella nuova il tuo "settings.txt" e la tua cartella
+   "decks" presi da quella vecchia.
+4. Fai doppio clic su Start nella cartella nuova; quella vecchia puoi
+   eliminarla.
+Se un giorno compare il messaggio che per una versione nuova "serve
+scaricare di nuovo Deck Inventory a mano", segui gli stessi passi.
+
 NOVITÀ
 ------
 Versione 1.1.0
