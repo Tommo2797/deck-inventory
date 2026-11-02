@@ -1,11 +1,16 @@
 """Crea lo zip da condividere: python make_share_zip.py <cartella_progetto> <out.zip>
 
-Esclude runtime, impostazioni, pagine generate, mazzi personali e file di sviluppo
-(test compresi).
+Se la cartella è un repository git, prende SOLO i file tracciati (`git ls-files`):
+un file ignorato o mai aggiunto non finisce mai nella release. Altrimenti prende
+tutti i file. In entrambi i casi esclude runtime, impostazioni, pagine generate,
+mazzi personali e file di sviluppo (test, ambienti .venv e strumenti di
+pubblicazione dell'autore compresi).
 Dentro lo zip mette un decks/order.txt di esempio (solo commenti).
 """
 import fnmatch
+import os
 import stat
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -15,8 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from deck_inventory.decks import _ORDER_HEADER  # noqa: E402
 
 ROOT_NAME = "Deck Inventory"
-EXCLUDED_DIRS = {".git", ".superpowers", "__pycache__", ".pytest_cache"}
-EXCLUDED_PATHS = {".app/runtime", ".app/src/tests", "decks", "docs", "settings.txt", ".gitignore", ".gitattributes"}
+EXCLUDED_DIRS = {".git", ".superpowers", "__pycache__", ".pytest_cache", ".venv"}
+EXCLUDED_PATHS = {
+    ".app/runtime", ".app/src/tests", "decks", "docs", "settings.txt", ".gitignore", ".gitattributes",
+    ".app/src/tools/publish.py", ".app/src/tools/publish.sh",
+}
 EXCLUDED_NAMES = {".DS_Store"}
 EXCLUDED_PATTERNS = ["Inventory *.html"]
 FIXED_DATE = (2026, 1, 1, 0, 0, 0)
@@ -41,10 +49,29 @@ def _add(zf: zipfile.ZipFile, name: str, data: bytes, mode: int) -> None:
     zf.writestr(info, data)
 
 
+def _git(project_dir: Path, *args: str) -> bytes | None:
+    try:
+        return subprocess.run(["git", "-C", str(project_dir), *args],
+                               capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _candidates(project_dir: Path) -> list[Path]:
+    """File tracciati da git se `project_dir` è la radice di un repository, altrimenti tutti."""
+    top = _git(project_dir, "rev-parse", "--show-toplevel")
+    if top is not None and Path(os.fsdecode(top.strip())).resolve() == project_dir.resolve():
+        listed = _git(project_dir, "ls-files", "-z")
+        if listed is None:
+            raise RuntimeError(f"git ls-files non riuscito in {project_dir}")
+        return [project_dir / os.fsdecode(n) for n in listed.split(b"\0") if n]
+    return list(project_dir.rglob("*"))
+
+
 def make_share_zip(project_dir: Path, out_zip: Path) -> None:
     project_dir = Path(project_dir)
     entries = []
-    for path in project_dir.rglob("*"):
+    for path in _candidates(project_dir):
         if not path.is_file():
             continue
         rel = path.relative_to(project_dir)

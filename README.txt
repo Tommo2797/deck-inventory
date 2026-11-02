@@ -23,7 +23,8 @@ PRIMO AVVIO
    anche un browser di alcune centinaia di MB (solo la prima volta).
 6. Al termine si apre la pagina con i risultati.
 
-Dai avvii successivi bastano pochi secondi.
+Dai avvii successivi bastano pochi secondi (qualcosa in più quando
+Deck Inventory installa una versione nuova).
 Nota: il file per Windows non è ancora stato provato. Il percorso della
 cartella non deve contenere i caratteri & o %.
 
@@ -53,7 +54,8 @@ doppio clic su Start per aggiornarlo.
 SE QUALCOSA NON VA
 ------------------
 Se compare "Piltover Archive è cambiato", il sito è stato modificato:
-chiedi una versione aggiornata di Deck Inventory. Nel messaggio e in fondo
+quando esce una versione corretta, Deck Inventory la installa da solo a un
+avvio successivo. Se tarda, chiedila all'autore. Nel messaggio e in fondo
 alla pagina trovi il numero di versione.
 
 CONDIVIDERE
@@ -71,3 +73,31 @@ già uno zip pulito.)
 DISINSTALLARE
 -------------
 Tutto resta dentro questa cartella: per rimuovere ogni cosa basta eliminarla.
+
+AGGIORNAMENTI
+-------------
+Deck Inventory si aggiorna da solo: a ogni avvio controlla se è uscita una
+versione nuova e, se c'è, la installa e ti mostra le novità. I tuoi mazzi,
+il link del binder e le pagine "Inventory ....html" non vengono toccati.
+Senza internet usa semplicemente la versione che ha.
+
+Se hai la versione 1.0.0 devi passare alla 1.1.0 a mano, una volta sola:
+1. Scarica "deck-inventory.zip" da
+   https://github.com/Tommo2797/deck-inventory/releases/latest
+2. Estrailo in una cartella nuova (non sopra quella vecchia).
+3. Copia nella cartella nuova il tuo "settings.txt" e la tua cartella
+   "decks" presi da quella vecchia.
+4. Fai doppio clic su Start nella cartella nuova; quella vecchia puoi
+   eliminarla.
+Se un giorno compare il messaggio che per una versione nuova "serve
+scaricare di nuovo Deck Inventory a mano", segui gli stessi passi.
+
+NOVITÀ
+------
+Versione 1.1.0
+• Il programma si aggiorna da solo quando esce una versione nuova.
+• Il README contiene lo storico delle versioni (questa sezione).
+• Chi ha la 1.0.0 passa alla 1.1.0 a mano, una volta sola (vedi AGGIORNAMENTI nel README).
+
+Versione 1.0.0 (2026-10-31)
+• Prima versione.

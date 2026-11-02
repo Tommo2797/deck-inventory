@@ -99,6 +99,12 @@ setlocal EnableDelayedExpansion
 >"!STATE_FILE!" echo(!ROOT!^|!OSARCH!
 endlocal
 
+rem Aggiornamento automatico (logica tutta in Python, che si aggiorna da se').
+rem Non blocca mai l'avvio: il codice d'uscita si ignora.
+set "DECK_INVENTORY_LAUNCHER=1"
+set "DECK_INVENTORY_UV=%UV%"
+"%UV%" run --project "%SRC%" --frozen --no-dev python -m deck_inventory.update "%ROOT%"
+
 rem In caso di errore Deck Inventory ha già mostrato il suo messaggio.
 "%UV%" run --project "%SRC%" --frozen --no-dev python -m deck_inventory "%ROOT%"
 exit /b %errorlevel%

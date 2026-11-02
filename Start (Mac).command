@@ -5,7 +5,8 @@
 #
 # Variabile per test automatici: DECK_INVENTORY_NO_DIALOG=1 salta i dialog del
 # launcher (prima installazione ed errori, che sono modali) e scrive i messaggi
-# sul terminale. I dialog di Deck Inventory stesso (Python) non cambiano.
+# sul terminale. La rispetta anche il passo di aggiornamento (nessun messaggio);
+# gli altri dialog di Deck Inventory stesso (Python) non cambiano.
 
 UV_VERSION="0.13.1"
 
@@ -123,6 +124,12 @@ if ! "$UV" sync --project "$SRC" --frozen --no-dev; then
     finish 1
 fi
 printf '%s\n' "$STATE" > "$STATE_FILE"
+
+# Aggiornamento automatico (logica tutta in Python, che si aggiorna da sé).
+# Non blocca mai l'avvio: il codice d'uscita si ignora.
+export DECK_INVENTORY_LAUNCHER=1
+export DECK_INVENTORY_UV="$UV"
+"$UV" run --project "$SRC" --frozen --no-dev python -m deck_inventory.update "$ROOT"
 
 # In caso di errore Deck Inventory ha già mostrato il suo messaggio.
 "$UV" run --project "$SRC" --frozen --no-dev python -m deck_inventory "$ROOT"
