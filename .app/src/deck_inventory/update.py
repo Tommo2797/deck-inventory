@@ -26,6 +26,7 @@ ASSET_NAME = "deck-inventory.zip"
 REQUIRED = (".app/src/deck_inventory/__init__.py", ".app/src/pyproject.toml", "README.txt")
 MOVE_ATTEMPTS = 5
 MOVE_DELAY = 0.5
+README_BAK = "README.txt.bak"
 
 _rename = os.rename
 _sleep = time.sleep
@@ -151,18 +152,28 @@ def _retry(action: Callable[[], None]) -> None:
 
 
 def _move(src: Path, dst: Path) -> None:
-    """Rinomina con più tentativi (file bloccati su Windows); ripiego: copia + rimozione."""
+    """Rinomina con più tentativi (file bloccati su Windows); ripiego: copia + rimozione.
+
+    Se solleva, `src` è di nuovo completa (salvo errori anche nel ripristino).
+    """
     try:
         _retry(lambda: _rename(src, dst))
         return
     except OSError:
         pass
+    created = not dst.exists()
     try:
         shutil.copytree(src, dst)
     except BaseException:
-        shutil.rmtree(dst, ignore_errors=True)  # niente copie a metà: src resta intatta
+        if created:
+            shutil.rmtree(dst, ignore_errors=True)  # niente copie a metà
         raise
-    _retry(lambda: shutil.rmtree(src))
+    try:
+        _retry(lambda: shutil.rmtree(src))
+    except OSError:
+        # Rimozione interrotta da un file bloccato: rimette in `src` quanto già cancellato.
+        shutil.copytree(dst, src, dirs_exist_ok=True)
+        raise
 
 
 def _remove(path: Path) -> None:
@@ -170,6 +181,26 @@ def _remove(path: Path) -> None:
         _retry(lambda: shutil.rmtree(path))
     elif path.exists():
         path.unlink()
+
+
+def _complete(src: Path) -> bool:
+    return (src / "deck_inventory" / "__init__.py").is_file() and (src / "pyproject.toml").is_file()
+
+
+def _restore(src: Path, previous: Path, readme: Path) -> None:
+    """Rimette la vecchia `.app/src` (da `previous`) e il README salvato."""
+    bak = previous / README_BAK
+    if bak.exists():
+        os.replace(bak, readme)
+    if src.exists():
+        try:
+            _remove(src)
+        except OSError:
+            # File bloccato: si sovrascrive quel che resta con la versione vecchia.
+            shutil.copytree(previous, src, dirs_exist_ok=True)
+            shutil.rmtree(previous, ignore_errors=True)
+            return
+    _move(previous, src)
 
 
 def _notes(src: Path, old: str, new: str) -> str:
@@ -186,7 +217,8 @@ def check_and_update(root: Path, launcher: int,
     src = root / ".app" / "src"
     work = root / ".app" / "runtime" / "update"
     staging, previous = work / "staging", work / "previous"
-    readme, readme_bak = root / "README.txt", previous / "README.txt.bak"
+    marker = work / "swap-in-progress"
+    readme = root / "README.txt"
 
     def log(msg: str) -> None:
         try:
@@ -195,10 +227,20 @@ def check_and_update(root: Path, launcher: int,
             stamp = "?"
         log_error(root, f"{stamp} aggiornamento: {msg}")
 
+    def sync(label: str) -> None:
+        try:
+            ok = run_sync(src)
+        except Exception as e:
+            ok = False
+            label += f" ({e!r})"
+        if not ok:
+            log(f"uv sync non riuscito {label}")
+
     old = VERSION
     try:
         if (root / ".git").exists() or launcher < 1:
             return Outcome("skipped", old)
+        _recover(src, previous, marker, readme, log, sync)
         old = read_meta(src)[0]
         release = latest_release(fetch_json)
         if release is None:
@@ -213,9 +255,10 @@ def check_and_update(root: Path, launcher: int,
         log(f"controllo non riuscito: {e!r}")
         return Outcome("failed", old)
 
-    swapped = False
-    had_readme = readme.exists()
+    old_moved = False
+    readme_replaced = False
     try:
+        had_readme = readme.exists()
         if staging.exists():
             _remove(staging)
         staging.mkdir(parents=True)
@@ -234,20 +277,33 @@ def check_and_update(root: Path, launcher: int,
             return Outcome("needs_launcher", old, new, notes)
 
         if previous.exists():
-            _remove(previous)
-        swapped = True
+            _remove(previous)  # _recover ha già stabilito che non serve
+        marker.touch()
         _move(src, previous)
+        old_moved = True
         if had_readme:
-            shutil.copy2(readme, readme_bak)
+            shutil.copy2(readme, previous / README_BAK)
         _move(rel_root / ".app" / "src", src)
         os.replace(rel_root / "README.txt", readme)
+        readme_replaced = True
         if not run_sync(src):
             raise UpdateError("uv sync non riuscito con la nuova versione")
     except Exception as e:
         log(f"installazione della {new} non riuscita, resta la {old}: {e!r}")
-        if swapped:
-            _rollback(src, previous, readme, readme_bak, had_readme, run_sync, log)
-        _cleanup(staging)  # `previous` resta: se il ripristino non è riuscito contiene la versione vecchia
+        restored = True
+        if old_moved:
+            try:
+                _restore(src, previous, readme)
+                if readme_replaced and not had_readme and readme.exists():
+                    readme.unlink()
+                sync("anche sulla versione ripristinata")
+            except Exception as e2:
+                restored = False
+                log(f"ripristino non riuscito, si riprova al prossimo avvio: {e2!r}")
+        if restored:
+            _settle(src, previous, marker, staging)
+        else:
+            _cleanup(staging)  # `previous` e il segnale restano per _recover
         return Outcome("failed", old, new)
 
     try:
@@ -255,29 +311,26 @@ def check_and_update(root: Path, launcher: int,
     except Exception as e:
         log(f"CHANGELOG della {new} illeggibile, note omesse: {e!r}")
         notes = ""
+    marker.unlink(missing_ok=True)
     _cleanup(staging, previous)
     return Outcome("updated", old, new, notes)
 
 
-def _rollback(src, previous, readme, readme_bak, had_readme, run_sync, log) -> None:
-    try:
-        if previous.exists():  # contiene la vecchia .app/src completa (le copie a metà vengono rimosse)
-            if src.exists():
-                _remove(src)
-            _move(previous, src)
-            bak = src / readme_bak.name
-            if bak.exists():
-                os.replace(bak, readme)
-            elif not had_readme and readme.exists():
-                readme.unlink()
-    except Exception as e:
-        log(f"ripristino non riuscito: {e!r}")
-        return
-    try:
-        if not run_sync(src):
-            log("uv sync non riuscito anche sulla versione ripristinata")
-    except Exception as e:
-        log(f"uv sync non riuscito anche sulla versione ripristinata: {e!r}")
+def _recover(src, previous, marker, readme, log, sync) -> None:
+    """Sistema i resti di uno scambio interrotto (programma chiuso a metà, ripristino fallito)."""
+    if _complete(previous) and (marker.exists() or not _complete(src)):
+        log("scambio interrotto trovato: ripristino la versione precedente")
+        _restore(src, previous, readme)
+        sync("dopo il ripristino della versione precedente")
+    _settle(src, previous, marker)
+
+
+def _settle(src: Path, previous: Path, marker: Path, *extra: Path) -> None:
+    """Pulisce solo se `.app/src` è completa; altrimenti lascia tutto per il prossimo avvio."""
+    _cleanup(*extra)
+    if _complete(src):
+        marker.unlink(missing_ok=True)
+        _cleanup(previous)
 
 
 def _cleanup(*paths: Path) -> None:

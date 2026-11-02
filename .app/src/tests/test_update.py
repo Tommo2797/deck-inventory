@@ -372,3 +372,150 @@ def test_module_has_no_ui_imports():
     text = Path(update.__file__).read_text(encoding="utf-8")
     for name in ("tkinter", "playwright", "dialogs", "deck_inventory.main"):
         assert f"import {name}" not in text and f"from {name}" not in text
+
+
+# --- file bloccati e scambi interrotti -------------------------------------
+
+def _lock(monkeypatch, locked: Path):
+    """Simula un file bloccato su Windows: rmtree cancella il resto e poi fallisce."""
+    real = update.shutil.rmtree
+
+    def rmtree(path, ignore_errors=False, **kw):
+        path = Path(path)
+        if locked.exists() and path in locked.parents:
+            for f in path.rglob("*"):
+                if f.is_file() and f != locked:
+                    f.unlink()
+            if not ignore_errors:
+                raise PermissionError(f"in uso: {locked}")
+            return
+        real(path, ignore_errors=ignore_errors, **kw)
+
+    monkeypatch.setattr(update.shutil, "rmtree", rmtree)
+
+
+def _always_locked_rename(src, dst):
+    raise PermissionError("in uso")
+
+
+def test_locked_file_during_first_move_keeps_old_src(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+    monkeypatch.setattr(update, "_rename", _always_locked_rename)
+    _lock(monkeypatch, proj / ".app/src/deck_inventory/modulo.py")
+    sync = Sync()
+    out = _run(proj, data, sync=sync)
+    monkeypatch.undo()
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert sync.calls == []
+    upd = proj / ".app/runtime/update"
+    assert not (upd / "previous").exists() and not (upd / "swap-in-progress").exists()
+
+
+def test_locked_file_during_rollback_overlays_old_src(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+    _lock(monkeypatch, proj / ".app/src/deck_inventory/modulo.py")
+    sync = Sync([False, True])
+    out = _run(proj, data, sync=sync)
+    monkeypatch.undo()
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert len(sync.calls) == 2
+    assert not (proj / ".app/runtime/update/swap-in-progress").exists()
+
+
+def test_partial_copy_of_old_src_is_never_restored(proj, tmp_path, monkeypatch):
+    """La copia di ripiego src→previous si interrompe: src resta quella buona."""
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+
+    prev = proj / ".app/runtime/update/previous"
+
+    def broken_copytree(src, dst, **kw):
+        # Copia a metà che sembra completa e che non si riesce a cancellare (file bloccato).
+        (Path(dst) / "deck_inventory").mkdir(parents=True)
+        (Path(dst) / "deck_inventory/__init__.py").write_text('VERSION = "1.0.0"\n')
+        (Path(dst) / "pyproject.toml").write_text("parziale")
+        raise OSError("disco pieno")
+
+    monkeypatch.setattr(update, "_rename", _always_locked_rename)
+    monkeypatch.setattr(update.shutil, "copytree", broken_copytree)
+    _lock(monkeypatch, prev / "pyproject.toml")
+    out = _run(proj, data)
+    monkeypatch.undo()
+    assert out.status == "failed"
+    assert _snapshot(proj) == before
+    assert not (proj / ".app/runtime/update/swap-in-progress").exists()
+    # Al prossimo avvio la copia parziale rimasta viene solo eliminata.
+    assert update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now).status == "current"
+    assert _snapshot(proj) == before
+    assert not prev.exists()
+
+
+def _interrupted(proj, *, src_state: str):
+    """Riproduce i resti di uno scambio interrotto a metà."""
+    upd = proj / ".app/runtime/update"
+    upd.mkdir(parents=True, exist_ok=True)
+    (upd / "swap-in-progress").touch()
+    (proj / ".app/src").rename(upd / "previous")
+    if src_state == "half-new":
+        (upd / "previous/README.txt.bak").write_bytes((proj / "README.txt").read_bytes())
+        (proj / ".app/src/deck_inventory").mkdir(parents=True)
+        (proj / ".app/src/deck_inventory/__init__.py").write_text('VERSION = "1.1.0"\n')
+        (proj / "README.txt").write_text("README NUOVO 1.1.0\n")
+
+
+@pytest.mark.parametrize("src_state", ["missing", "half-new"])
+def test_interrupted_swap_is_recovered(proj, src_state):
+    before = _snapshot(proj)
+    _interrupted(proj, src_state=src_state)
+    sync = Sync()
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, sync, _now)
+    assert out.status == "current"
+    assert out.old == "1.0.0"
+    assert _snapshot(proj) == before
+    upd = proj / ".app/runtime/update"
+    assert not (upd / "previous").exists() and not (upd / "swap-in-progress").exists()
+    assert "scambio interrotto" in _error_log(proj)
+
+
+def test_interrupted_swap_recovery_runs_sync(proj):
+    _interrupted(proj, src_state="half-new")
+    sync = Sync()
+    update.check_and_update(proj, 1, _api("v1.0.0"), None, sync, _now)
+    assert sync.calls == [proj / ".app/src"]
+
+
+def test_leftover_previous_without_marker_is_cleaned(proj):
+    import shutil
+    before = _snapshot(proj)
+    prev = proj / ".app/runtime/update/previous"
+    shutil.copytree(proj / ".app/src", prev)
+    (prev / "deck_inventory/modulo.py").write_text("# vecchia roba\n")
+    sync = Sync()
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, sync, _now)
+    assert out.status == "current"
+    assert _snapshot(proj) == before
+    assert not prev.exists()
+    assert sync.calls == []
+
+
+def test_failed_restore_keeps_previous_for_next_run(proj, tmp_path, monkeypatch):
+    data = _release_zip(tmp_path, "1.1.0")
+    before = _snapshot(proj)
+
+    def broken_restore(src, previous, readme):
+        raise OSError("ripristino impossibile")
+
+    monkeypatch.setattr(update, "_restore", broken_restore)
+    out = _run(proj, data, sync=Sync([False]))
+    assert out.status == "failed"
+    upd = proj / ".app/runtime/update"
+    assert (upd / "previous/deck_inventory/__init__.py").exists()
+    assert (upd / "swap-in-progress").exists()
+    monkeypatch.undo()
+    out = update.check_and_update(proj, 1, _api("v1.0.0"), None, Sync(), _now)
+    assert out.status == "current"
+    assert _snapshot(proj) == before
