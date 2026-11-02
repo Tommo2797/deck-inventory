@@ -94,7 +94,7 @@ scaricare di nuovo Deck Inventory a mano", segui gli stessi passi.
 
 NOVITÀ
 ------
-Versione 1.1.0
+Versione 1.1.0 (2026-11-02)
 • Il programma si aggiorna da solo quando esce una versione nuova.
 • Il README contiene lo storico delle versioni (questa sezione).
 • Chi ha la 1.0.0 passa alla 1.1.0 a mano, una volta sola (vedi AGGIORNAMENTI nel README).
