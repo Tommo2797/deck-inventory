@@ -12,6 +12,7 @@ Documenti di riferimento (l'intento è lì; il codice è la verità sui dettagli
 - `docs/2026-10-31-deck-inventory-design.md` — tool base (1.0.0)
 - `docs/2026-11-02-auto-update-design.md` — aggiornamento automatico e storico (1.1.0)
 - `docs/plans/*` — piani di implementazione **storici**: in alcuni punti superati (vedi "Differenze rispetto ai piani").
+- `docs/BACKLOG.md` — cose da verificare, fix e idee ancora da fare.
 
 ## Mappa del codice
 
@@ -73,23 +74,11 @@ Se un launcher deve cambiare: aumentare `MIN_LAUNCHER` in `deck_inventory/__init
 - Identità git del repo: `Tommo2797 <46868658+Tommo2797@users.noreply.github.com>` (configurata localmente nel repo).
 - Ramo locale **`backup/pre-public`**: storia vecchia **con dati personali**. Solo copia di sicurezza, scollegato da GitHub: **non fare mai push**.
 
-## Stato e cose aperte
+## Stato
 
 Verificato: Mac end-to-end (installazione da zero, spostamento cartella, fallback Chromium, aggiornamento con finto GitHub in 5 scenari, download reale da GitHub in sola lettura, release 1.1.0 scaricata e validata con il codice dell'updater).
 
-Da verificare:
-- **Windows mai provato** (launcher, lock `msvcrt`, scambio cartelle con file bloccati, `uv sync` annidato mentre python.exe gira).
-- **Finestra "aggiornato dalla X alla Y"** mai vista a schermo (testata solo con UI finta): guardarla alla prossima release su un'installazione non-git.
-- **Blocco al primo avvio** visto due volte in run di agent: quasi certamente Chrome nel sandbox; confermare con un doppio clic reale su una copia nuova.
-- **Binder privato**: rilevato come "privato/inesistente" (con attesa sull'intestazione "User Not Found" e controllo del `<title>`), testato su binder inesistente ma mai su un binder reso privato.
-
-Migliorie rimandate (si possono consegnare con l'auto-update):
-- finestra di avanzamento durante download/sync dell'aggiornamento;
-- pausa dopo aggiornamenti falliti ripetuti (oggi riprova a ogni avvio);
-- timeout DNS (i 3 s non coprono `getaddrinfo`);
-- `publish` non rifiuta se un launcher è cambiato senza aumentare `MIN_LAUNCHER`;
-- avvio concorrente: il secondo launcher salta l'update (lock) ma può partire mentre il primo scambia i file (non distruttivo, richiede modifica ai launcher);
-- piccole: host dello zip non limitato a GitHub, nessun limite di dimensione dello zip, redazione del link in `publish` solo sulla stringa esatta, `set_release_date` con CRLF, nomi di mazzo duplicati in `order.txt` ignorati in silenzio, messaggio "pagina precedente non toccata" impreciso se fallisce l'apertura del browser.
+Cose da verificare, migliorie rimandate e idee: **`docs/BACKLOG.md`**.
 
 ## Differenze rispetto ai piani
 
